@@ -188,7 +188,9 @@ def get_args_parser(subparsers):
                             help='原型路由权重 β')
     subparsers.add_argument('--proto_temperature', default=0.10, type=float,
                             help='原型相似度温度 τ_P')
-    subparsers.add_argument('--adaptive_gamma', default=True, type=lambda x: (str(x).lower() == 'true'),
+    subparsers.add_argument('--use_diff_retrieval', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用 Gradient-Decoupled Differentiable Retrieval')
+    subparsers.add_argument('--adaptive_gamma', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用置信度门控的自适应 γ')
     subparsers.add_argument('--gamma_max', default=0.35, type=float,
                             help='自适应 γ 最大值')

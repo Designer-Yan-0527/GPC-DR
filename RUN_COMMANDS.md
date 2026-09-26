@@ -145,7 +145,8 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
   --msp_coherence_coeff=0.0 \
-  --adaptive_gamma=True --gamma_max=0.35 \
+  --adaptive_gamma=False --gamma_max=0.35 \
+  --use_diff_retrieval=True \
   --use_proto_replay=False --use_seen_routing=False \
   --use_proto_calibration=False --use_gpa=False
 ```
@@ -161,6 +162,7 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
   --msp_coherence_coeff=0.0 \
   --adaptive_gamma=True --gamma_max=0.35 \
+  --use_diff_retrieval=True \
   --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
   --lambda_pcr=0.05 \
   --use_gpa=True --lambda_gpa=0.2 \
@@ -268,6 +270,7 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
   --msp_coherence_coeff=0.0 \
   --adaptive_gamma=True --gamma_max=0.30 \
+  --use_diff_retrieval=True \
   --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
   --lambda_pcr=0.05 \
   --use_gpa=True --lambda_gpa=0.2 \

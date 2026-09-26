@@ -108,8 +108,9 @@ class Client_DF:
         self.use_proto_calibration = getattr(args, 'use_proto_calibration', False)
         self.proto_beta = getattr(args, 'proto_beta', 0.5)
         self.proto_temperature = getattr(args, 'proto_temperature', 0.10)
-        self.adaptive_gamma = getattr(args, 'adaptive_gamma', True)
+        self.adaptive_gamma = getattr(args, 'adaptive_gamma', False)
         self.gamma_max = getattr(args, 'gamma_max', 0.35)
+        self.use_diff_retrieval = getattr(args, 'use_diff_retrieval', False)
         self.use_gpa = getattr(args, 'use_gpa', False)
         self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
         self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
@@ -187,6 +188,7 @@ class Client_DF:
                 proto_temperature=self.proto_temperature,
                 adaptive_gamma=self.adaptive_gamma,
                 gamma_max=self.gamma_max,
+                use_diff_retrieval=self.use_diff_retrieval,
             )
 
     def _init_log_file(self):
@@ -335,7 +337,26 @@ class Client_DF:
 
         return bank, valid
 
-    def _compute_route_loss(self, similarity, target, seen_classes):
+    def _compute_pcr_loss(self, routing_logits, target, seen_classes):
+        """GPC-DR: PCR loss on proto-calibrated routing logits (no extra temperature)"""
+        if len(seen_classes) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        seen_list = sorted(seen_classes)
+        seen_idx = torch.tensor(seen_list, device=target.device, dtype=torch.long)
+        logits = routing_logits[:, seen_idx]
+        global_to_local = {g: i for i, g in enumerate(seen_list)}
+        local_target = torch.tensor(
+            [global_to_local[int(t.item())] for t in target],
+            device=target.device, dtype=torch.long
+        )
+        return F.cross_entropy(logits, local_target)
+
+    def _build_proto_calib_mask(self, task):
+        """GPC-DR: proto calibration restricted to classes of a specific task"""
+        mask = torch.zeros(self.nb_classes, dtype=torch.bool, device=self.device)
+        mask[torch.tensor(self.class_mask[task], dtype=torch.long, device=self.device)] = True
+        return mask
         """
         FedSMR-v2: 监督路由损失 L_route
 
@@ -475,22 +496,30 @@ class Client_DF:
 
                 loss = criterion(logits, target) - 0.1 * pull_off
 
-                # ---- GPC-DR: Global Prototype Alignment (Phase 1) ----
+                # ---- GPC-DR: Global Prototype Alignment (Phase 1, CE form) ----
                 if self.use_gpa and self.global_protos is not None:
-                    gpa_loss = torch.tensor(0.0, device=self.device)
-                    gpa_count = 0
+                    gpa_logits_list = []
+                    gpa_target_list = []
                     feat_norm = F.normalize(feat_prompt, dim=1)
-                    for i, y in enumerate(target):
-                        y_int = y.item()
+                    for y_int in self.current_class:
                         if y_int in self.global_protos:
                             proto = torch.as_tensor(self.global_protos[y_int],
                                                     dtype=torch.float32,
                                                     device=self.device).view(-1)[:768]
                             proto_norm = F.normalize(proto.unsqueeze(0), dim=1)
-                            gpa_loss = gpa_loss + (1.0 - (feat_norm[i:i+1] * proto_norm).sum())
-                            gpa_count += 1
-                    if gpa_count > 0:
-                        gpa_loss = gpa_loss / gpa_count
+                            sim = torch.matmul(feat_norm, proto_norm.t()).squeeze(1) / 0.10
+                            gpa_logits_list.append(sim)
+                            gpa_target_list.append(y_int)
+                    if gpa_logits_list:
+                        gpa_logits = torch.stack(gpa_logits_list, dim=1)  # (B, num_proto)
+                        gpa_target = torch.tensor(gpa_target_list, device=self.device, dtype=torch.long)
+                        # map target labels to column indices
+                        proto_to_idx = {c: i for i, c in enumerate(gpa_target_list)}
+                        gpa_labels = torch.tensor(
+                            [proto_to_idx.get(t.item(), 0) for t in target],
+                            device=self.device, dtype=torch.long
+                        )
+                        gpa_loss = F.cross_entropy(gpa_logits, gpa_labels)
                         loss = loss + self.lambda_gpa * gpa_loss
                 # ----------------------------------------------------
 
@@ -548,13 +577,15 @@ class Client_DF:
                                       cls_features=cls_features, train=True)
                     feat_prompt = output['feat']
 
-                # GPC-DR: build proto bank for calibrated routing
+                # GPC-DR: build proto bank + calib mask
                 proto_bank, proto_valid = self._build_semantic_proto_bank()
+                proto_calib_mask = self._build_proto_calib_mask(self.task_id)
 
                 pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx, routing_logits = self.model(
                     feat_prompt.to(self.device), target.to(self.device),
                     global_step=global_step, total_steps=total_steps * 2,
-                    proto_bank=proto_bank, proto_valid_mask=proto_valid
+                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
+                    proto_calib_mask=proto_calib_mask
                 )
                 logits = pre
 
@@ -613,13 +644,13 @@ class Client_DF:
                     - 0.1 * pull_off2
                 )
 
-                # ---- GPC-DR: PCR loss (on real routing_logits) or legacy route loss ----
-                if self.use_proto_calibration and self.use_route_loss:
-                    route_loss = self._compute_route_loss(
+                # ---- GPC-DR: PCR loss (no extra temperature) or legacy route loss ----
+                if self.use_proto_calibration:
+                    pcr_loss = self._compute_pcr_loss(
                         routing_logits, target, self.seen_classes
                     )
-                    loss = loss + self.lambda_pcr * route_loss
-                elif self.use_route_loss and not self.use_proto_calibration:
+                    loss = loss + self.lambda_pcr * pcr_loss
+                elif self.use_route_loss:
                     sim = self.model.compute_similarity(feat_prompt.to(self.device))
                     route_loss = self._compute_route_loss(
                         sim, target, self.seen_classes
@@ -688,8 +719,13 @@ class Client_DF:
                     output = output['pre_logits'].requires_grad_(False)
                 output = self.vit(input, task_id=self.task_id, cls_features=output,
                                   train=True)
-                _, output_mixed, _, _, _, _, _ = self.model(
-                    output['feat'].to(self.device), target.to(self.device)
+                proto_bank, proto_valid = self._build_semantic_proto_bank()
+            proto_calib_mask = self._build_proto_calib_mask(self.task_id)
+
+            _, output_mixed, _, _, _, _, _ = self.model(
+                    output['feat'].to(self.device), target.to(self.device),
+                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
+                    proto_calib_mask=proto_calib_mask
                 )
 
             if not np.isnan(output_mixed.cpu().detach().numpy()).any():
@@ -822,6 +858,10 @@ class Client_DF:
         do_hard_diag = (self.use_soft_anchor and task < self.task_id)
         hard_correct = 0
 
+        # GPC-DR: proto bank for calibrated evaluation
+        proto_bank, proto_valid = self._build_semantic_proto_bank()
+        proto_calib_mask = self._build_proto_calib_mask(task)
+
         for input, target in test_loader:
             input = input.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
@@ -834,14 +874,22 @@ class Client_DF:
                     feat = output['feat'].to(self.device)
 
                 # 正常 E1 soft inference
-                pre, _, _, _, _, _, _ = self.model(feat, target.to(self.device))
+                pre, _, _, _, _, _, _ = self.model(
+                    feat, target.to(self.device),
+                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
+                    proto_calib_mask=proto_calib_mask
+                )
 
                 # Paired hard inference (同一 batch, 同一 ViT feature, 同一 head)
                 if do_hard_diag:
                     original_flag = self.model.soft_anchor
                     try:
                         self.model.soft_anchor = False
-                        pre_hard, _, _, _, _, _, _ = self.model(feat, target.to(self.device))
+                        pre_hard, _, _, _, _, _, _ = self.model(
+                                feat, target.to(self.device),
+                                proto_bank=proto_bank, proto_valid_mask=proto_valid,
+                                proto_calib_mask=proto_calib_mask
+                            )
                     finally:
                         self.model.soft_anchor = original_flag
 
