@@ -39,6 +39,10 @@
 | E3 (FedSMR) | ✓ | ✓ | ✓ | | |
 | E4 (+Proto) | ✓ | ✓ | ✓ | ✓ | |
 | E5 (+SeenRoute) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| E6a (+DiffRetrieval) | ✓ | ✓ | ✓ | | | *Diff. Retrieval |
+| E6b (GPC-DR) | ✓ | PCR | ✓ | | | *Full GPC-DR |
+
+\* E6a: adaptive_gamma + anchor_pool.detach(); E6b: + proto_calibration + GPA
 
 ---
 
@@ -131,6 +135,38 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_seen_routing=True
 ```
 
+### E6a. E3 + Differentiable Retrieval (GPC-DR step 1)
+
+```bash
+python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
+  --data_name cifar100 --output_dir ./output/cifar100_e6a \
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 \
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
+  --msp_coherence_coeff=0.0 \
+  --adaptive_gamma=True --gamma_max=0.35 \
+  --use_proto_replay=False --use_seen_routing=False \
+  --use_proto_calibration=False --use_gpa=False
+```
+
+### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
+
+```bash
+python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
+  --data_name cifar100 --output_dir ./output/cifar100_e6b \
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 \
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
+  --msp_coherence_coeff=0.0 \
+  --adaptive_gamma=True --gamma_max=0.35 \
+  --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
+  --lambda_pcr=0.05 \
+  --use_gpa=True --lambda_gpa=0.2 \
+  --use_proto_replay=False --use_seen_routing=False
+```
+
 ---
 
 ## 二、ImageNet-R
@@ -206,6 +242,38 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_seen_routing=True
 ```
 
+### E6a. E3 + Differentiable Retrieval (GPC-DR step 1)
+
+```bash
+python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
+  --data_name ImageNet-R --output_dir ./output/imagenet_r_e6a \
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.15 \
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
+  --msp_coherence_coeff=0.0 \
+  --adaptive_gamma=True --gamma_max=0.30 \
+  --use_proto_replay=False --use_seen_routing=False \
+  --use_proto_calibration=False --use_gpa=False
+```
+
+### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
+
+```bash
+python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
+  --data_name ImageNet-R --output_dir ./output/imagenet_r_e6b \
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.15 \
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
+  --msp_coherence_coeff=0.0 \
+  --adaptive_gamma=True --gamma_max=0.30 \
+  --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
+  --lambda_pcr=0.05 \
+  --use_gpa=True --lambda_gpa=0.2 \
+  --use_proto_replay=False --use_seen_routing=False
+```
+
 ---
 
 ## 三、参数速查
@@ -227,19 +295,34 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
 | Proto Replay | `--use_proto_replay` | True (E4+) | True (E4+) | ablation |
 | Proto 权重 | `--lambda_proto` | 0.2 | 0.3 | |
 | Seen Routing | `--use_seen_routing` | True (E5) | True (E5) | ablation |
+| **GPC-DR** | `--use_proto_calibration` | True (E6b) | True (E6b) | Proto-calibrated routing |
+| Proto β | `--proto_beta` | 0.5 | 0.5 | 原型路由权重 |
+| Proto τ | `--proto_temperature` | 0.10 | 0.10 | 原型相似度温度 |
+| Adaptive γ | `--adaptive_gamma` | True (E6a+) | True (E6a+) | 置信度门控 |
+| γ_max | `--gamma_max` | 0.35 | 0.30 | 自适应γ上限 |
+| GPA | `--use_gpa` | True (E6b) | True (E6b) | Phase1 原型对齐 |
+| GPA 权重 | `--lambda_gpa` | 0.2 | 0.2 | |
+| PCR 权重 | `--lambda_pcr` | 0.05 | 0.05 | PCR 损失权重 |
 
 ---
 
 ## 四、损失函数
 
+### Phase 1 (Prompt)
 ```
-L = L_CE
-  + λ_cons · L_cons                     # FedTA 原始: global-prototype contrastive loss (InfoNCE)
-  - 0.1 · L_pull_off                    # FedTA 原始: 拉约束
-  + λ_route · L_route                   # E2+: 监督 Key 路由
-  + α_div · L_div(seen, margin)         # E3+: Seen-Only Diversity
-  + α_tmp · (L_anchor_tmp + η·L_key_tmp)  # E3+: Key+Anchor Temporal
-  + λ_proto · L_proto_replay            # E4+: Prototype Head Replay (ablation)
+L_P1 = L_CE_prompt - 0.1·L_pull + λ_gpa·L_GPA     # E6b: GPA aligns prompt to global proto
+```
+
+### Phase 2 (Tail Anchor)
+```
+L_P2 = L_CE
+     + λ_cons · L_cons                     # FedTA: global-prototype contrastive (InfoNCE)
+     - 0.1 · L_pull_off                    # FedTA: 拉约束
+     + λ_route·L_route (or λ_pcr·L_PCR)   # E2+/E6b: 监督路由 (PCR uses proto-calibrated logits)
+     + α_div · L_div(seen, margin)         # E3+: Seen-Only Diversity
+     + α_tmp · (L_anchor_tmp + η·L_key_tmp)  # E3+: Key+Anchor Temporal
+     + λ_proto · L_proto_replay            # E4+: Prototype Head Replay (ablation)
+```
 ```
 
 ---

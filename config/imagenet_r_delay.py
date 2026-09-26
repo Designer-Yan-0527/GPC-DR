@@ -180,6 +180,24 @@ def get_args_parser(subparsers):
     # [已删除] use_class_aware_head_agg、use_head_grad_mask、use_fed_smr_aggregate
     # 原始 FedTA 设计：vit.head 做全局 FedAvg，Tail Anchor model.head 做 per-task 快照
 
+    # ===== GPC-DR: Global Prototype-Calibrated Differentiable Retrieval =====
+    subparsers.add_argument('--use_proto_calibration', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用全局原型校准路由 (GPC-DR)')
+    subparsers.add_argument('--proto_beta', default=0.5, type=float,
+                            help='原型路由权重 β')
+    subparsers.add_argument('--proto_temperature', default=0.10, type=float,
+                            help='原型相似度温度 τ_P')
+    subparsers.add_argument('--adaptive_gamma', default=True, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用置信度门控的自适应 γ')
+    subparsers.add_argument('--gamma_max', default=0.30, type=float,
+                            help='自适应 γ 最大值 (ImageNet-R)')
+    subparsers.add_argument('--use_gpa', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用 Phase 1 Global Prototype Alignment')
+    subparsers.add_argument('--lambda_gpa', default=0.2, type=float,
+                            help='GPA 损失权重')
+    subparsers.add_argument('--lambda_pcr', default=0.05, type=float,
+                            help='PCR 损失权重 (proto calibration 启用时替代 lambda_route)')
+
     # -- 已废弃/可选增强 --
     subparsers.add_argument('--use_soft_prompt', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='[已废弃] Soft Prompt Retrieval')

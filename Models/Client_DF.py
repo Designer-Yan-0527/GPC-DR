@@ -104,6 +104,15 @@ class Client_DF:
         self.use_proto_replay = getattr(args, 'use_proto_replay', False)
         self.lambda_proto = getattr(args, 'lambda_proto', 0.2)
         self.use_seen_routing = getattr(args, 'use_seen_routing', False)
+        # GPC-DR
+        self.use_proto_calibration = getattr(args, 'use_proto_calibration', False)
+        self.proto_beta = getattr(args, 'proto_beta', 0.5)
+        self.proto_temperature = getattr(args, 'proto_temperature', 0.10)
+        self.adaptive_gamma = getattr(args, 'adaptive_gamma', True)
+        self.gamma_max = getattr(args, 'gamma_max', 0.35)
+        self.use_gpa = getattr(args, 'use_gpa', False)
+        self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
+        self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
         # 已废弃保留
         self.use_soft_prompt = getattr(args, 'use_soft_prompt', False)
         self.use_sparse_softmax = getattr(args, 'use_sparse_softmax', False)
@@ -172,6 +181,12 @@ class Client_DF:
                 use_sparse_softmax=self.use_sparse_softmax,
                 diversity_margin=self.diversity_margin,
                 use_seen_routing=self.use_seen_routing,
+                # GPC-DR
+                use_proto_calibration=self.use_proto_calibration,
+                proto_beta=self.proto_beta,
+                proto_temperature=self.proto_temperature,
+                adaptive_gamma=self.adaptive_gamma,
+                gamma_max=self.gamma_max,
             )
 
     def _init_log_file(self):
@@ -303,6 +318,22 @@ class Client_DF:
                     total_msp_loss = total_msp_loss + self.msp_temporal_coeff * loss_temporal
 
         return total_msp_loss
+
+    def _build_semantic_proto_bank(self):
+        """GPC-DR: 从 global_protos 提取 prompt-feature prototype bank (前768维)"""
+        bank = torch.zeros(self.nb_classes, 768, device=self.device)
+        valid = torch.zeros(self.nb_classes, dtype=torch.bool, device=self.device)
+
+        if self.global_protos is None:
+            return bank, valid
+
+        for c, proto in self.global_protos.items():
+            proto = torch.as_tensor(proto, dtype=torch.float32, device=self.device).view(-1)
+            if proto.numel() >= 768:
+                bank[int(c)] = proto[:768]
+                valid[int(c)] = True
+
+        return bank, valid
 
     def _compute_route_loss(self, similarity, target, seen_classes):
         """
@@ -443,7 +474,26 @@ class Client_DF:
                                            value=float('-inf'))
 
                 loss = criterion(logits, target) - 0.1 * pull_off
-                # P1.6 FIX: MSP 仅放 Phase 2 (Phase 1 optimizer 不更新 anchor/key)
+
+                # ---- GPC-DR: Global Prototype Alignment (Phase 1) ----
+                if self.use_gpa and self.global_protos is not None:
+                    gpa_loss = torch.tensor(0.0, device=self.device)
+                    gpa_count = 0
+                    feat_norm = F.normalize(feat_prompt, dim=1)
+                    for i, y in enumerate(target):
+                        y_int = y.item()
+                        if y_int in self.global_protos:
+                            proto = torch.as_tensor(self.global_protos[y_int],
+                                                    dtype=torch.float32,
+                                                    device=self.device).view(-1)[:768]
+                            proto_norm = F.normalize(proto.unsqueeze(0), dim=1)
+                            gpa_loss = gpa_loss + (1.0 - (feat_norm[i:i+1] * proto_norm).sum())
+                            gpa_count += 1
+                    if gpa_count > 0:
+                        gpa_loss = gpa_loss / gpa_count
+                        loss = loss + self.lambda_gpa * gpa_loss
+                # ----------------------------------------------------
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -498,10 +548,13 @@ class Client_DF:
                                       cls_features=cls_features, train=True)
                     feat_prompt = output['feat']
 
-                # FedSMR-v2: forward 返回 6 个值
-                pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx = self.model(
+                # GPC-DR: build proto bank for calibrated routing
+                proto_bank, proto_valid = self._build_semantic_proto_bank()
+
+                pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx, routing_logits = self.model(
                     feat_prompt.to(self.device), target.to(self.device),
-                    global_step=global_step, total_steps=total_steps * 2
+                    global_step=global_step, total_steps=total_steps * 2,
+                    proto_bank=proto_bank, proto_valid_mask=proto_valid
                 )
                 logits = pre
 
@@ -560,8 +613,13 @@ class Client_DF:
                     - 0.1 * pull_off2
                 )
 
-                # ---- FedSMR-v2: 路由损失 ----
-                if self.use_route_loss:
+                # ---- GPC-DR: PCR loss (on real routing_logits) or legacy route loss ----
+                if self.use_proto_calibration and self.use_route_loss:
+                    route_loss = self._compute_route_loss(
+                        routing_logits, target, self.seen_classes
+                    )
+                    loss = loss + self.lambda_pcr * route_loss
+                elif self.use_route_loss and not self.use_proto_calibration:
                     sim = self.model.compute_similarity(feat_prompt.to(self.device))
                     route_loss = self._compute_route_loss(
                         sim, target, self.seen_classes
@@ -630,7 +688,7 @@ class Client_DF:
                     output = output['pre_logits'].requires_grad_(False)
                 output = self.vit(input, task_id=self.task_id, cls_features=output,
                                   train=True)
-                _, output_mixed, _, _, _, _ = self.model(
+                _, output_mixed, _, _, _, _, _ = self.model(
                     output['feat'].to(self.device), target.to(self.device)
                 )
 
@@ -776,14 +834,14 @@ class Client_DF:
                     feat = output['feat'].to(self.device)
 
                 # 正常 E1 soft inference
-                pre, _, _, _, _, _ = self.model(feat, target.to(self.device))
+                pre, _, _, _, _, _, _ = self.model(feat, target.to(self.device))
 
                 # Paired hard inference (同一 batch, 同一 ViT feature, 同一 head)
                 if do_hard_diag:
                     original_flag = self.model.soft_anchor
                     try:
                         self.model.soft_anchor = False
-                        pre_hard, _, _, _, _, _ = self.model(feat, target.to(self.device))
+                        pre_hard, _, _, _, _, _, _ = self.model(feat, target.to(self.device))
                     finally:
                         self.model.soft_anchor = original_flag
 
@@ -832,7 +890,7 @@ class Client_DF:
                     output = self.original_model(input)
                     cls_features = output['pre_logits']
                     output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
-                _, output_mix, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                _, output_mix, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
 
             for i, label in enumerate(target):
                 predicts = CosineSimilarityClassifier(output_mix[i].squeeze(0), self.global_protos, self.class_mask[task])

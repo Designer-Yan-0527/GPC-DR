@@ -18,7 +18,13 @@ class Tail_Anchor(nn.Module):
                  top_k_anchor=None, temperature_anneal=False,
                  use_sparse_softmax=False,
                  diversity_margin=0.2,
-                 use_seen_routing=False):
+                 use_seen_routing=False,
+                 # GPC-DR
+                 use_proto_calibration=False,
+                 proto_beta=0.5,
+                 proto_temperature=0.10,
+                 adaptive_gamma=True,
+                 gamma_max=0.35):
         super(Tail_Anchor, self).__init__()
         self.size = anchor_size
         self.key_size = key_size
@@ -31,6 +37,13 @@ class Tail_Anchor(nn.Module):
         self.use_sparse_softmax = use_sparse_softmax
         self.diversity_margin = diversity_margin
         self.use_seen_routing = use_seen_routing
+
+        # GPC-DR
+        self.use_proto_calibration = use_proto_calibration
+        self.proto_beta = proto_beta
+        self.proto_temperature = proto_temperature
+        self.adaptive_gamma = adaptive_gamma
+        self.gamma_max = gamma_max
 
         self.temp_min = 0.03
         self.temp_max = max(soft_temperature, 0.5)
@@ -77,14 +90,17 @@ class Tail_Anchor(nn.Module):
             return similarity.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
         return similarity
 
-    def forward(self, x, class_mask, global_step=None, total_steps=None):
+    def forward(self, x, class_mask, global_step=None, total_steps=None,
+                proto_bank=None, proto_valid_mask=None):
         """
-        Returns: logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx
+        GPC-DR: Global Prototype-Calibrated Differentiable Retrieval
 
-        E1-Repair v1:
-        - reduce_sim always uses hard key (restores FedTA baseline pull loss)
-        - soft anchor uses stop-gradient residual: hard + γ·sg(soft-hard)
-        - forward values identical to before; backward only updates hard_anchor
+        Returns: logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx, routing_logits
+
+        Key innovations:
+        - Proto-calibrated routing: r = s^K/τ_K + β·s^P/τ_P
+        - Differentiable soft anchor: q @ A.detach() — CE → routing, anchor protected
+        - Confidence-gated adaptive γ: γ_i = γ_max·(1 - H(q_i)/log C)
         """
         # ---- 1. similarity ----
         x_embed_norm = self.l2_normalize(x, dim=1)
@@ -93,36 +109,48 @@ class Tail_Anchor(nn.Module):
 
         anchor_pool_raw = self.anchor_pool.reshape(-1, self.key_size).to(x.device)
 
-        # ---- 2. Hard routing (FedTA baseline path, always active) ----
+        # ---- 2. Routing logits ----
         routing_sim = self._get_routing_similarity(similarity)
-        hard_idx = routing_sim.argmax(dim=1)
-        hard_anchor = anchor_pool_raw[hard_idx]
 
-        # ---- 3. Hard-key pull (same as FedTA baseline regardless of soft_anchor) ----
-        batched_key_norm = key_norm[hard_idx]
-        reduce_sim = torch.sum(x_embed_norm * batched_key_norm.squeeze(1)) / self.key_size
-
-        # ---- 4. E1: Residual Soft Anchor (stop-gradient on residual) ----
         if self.soft_anchor:
             temp = self.compute_temperature(global_step, total_steps)
-            attn_logits = routing_sim / temp
+            routing_logits = routing_sim / temp
 
+            # GPC: global prototype-calibrated routing
+            if self.use_proto_calibration and proto_bank is not None and proto_valid_mask is not None:
+                proto_norm = F.normalize(proto_bank, dim=1)
+                proto_sim = torch.matmul(x_embed_norm, proto_norm.t().to(x.device))
+                routing_logits[:, proto_valid_mask] += (
+                    self.proto_beta * proto_sim[:, proto_valid_mask] / self.proto_temperature
+                )
+
+            # ---- Hard idx from calibrated routing ----
+            hard_idx = routing_logits.argmax(dim=1)
+            hard_anchor = anchor_pool_raw[hard_idx]
+
+            # ---- Soft attention ----
             if self.use_sparse_softmax and self.top_k_anchor is not None:
-                top_k = min(self.top_k_anchor, attn_logits.shape[1])
-                topk_logits, topk_idx = torch.topk(attn_logits, k=top_k, dim=1)
-                soft_attn = torch.zeros_like(attn_logits)
+                top_k = min(self.top_k_anchor, routing_logits.shape[1])
+                topk_logits, topk_idx = torch.topk(routing_logits, k=top_k, dim=1)
+                soft_attn = torch.zeros_like(routing_logits)
                 soft_attn.scatter_(1, topk_idx, torch.softmax(topk_logits, dim=1))
                 soft_attn = soft_attn / (soft_attn.sum(dim=1, keepdim=True) + 1e-8)
             else:
-                soft_attn = torch.softmax(attn_logits, dim=1)
+                soft_attn = torch.softmax(routing_logits, dim=1)
 
-            soft_anchor = torch.matmul(soft_attn, anchor_pool_raw)
+            # ---- Differentiable soft anchor (anchor_pool detached, routing through q) ----
+            soft_anchor = torch.matmul(soft_attn, anchor_pool_raw.detach())
 
-            # CRITICAL: stop-gradient on residual
-            # Forward:  hard + γ·(soft-hard) ≡ (1-γ)·hard + γ·soft  (identical)
-            # Backward: only hard_anchor receives CE gradient; soft branch detached
-            soft_residual = (soft_anchor - hard_anchor).detach()
-            anchor_feat = hard_anchor + self.soft_anchor_ratio * soft_residual
+            # ---- Confidence-gated adaptive γ ----
+            if self.adaptive_gamma:
+                entropy = -(soft_attn * torch.log(soft_attn + 1e-8)).sum(dim=1)
+                entropy_norm = entropy / np.log(self.nb_class)
+                confidence = (1.0 - entropy_norm).detach()
+                gamma = (self.gamma_max * confidence).unsqueeze(1)
+            else:
+                gamma = self.soft_anchor_ratio
+
+            anchor_feat = hard_anchor + gamma * (soft_anchor - hard_anchor)
 
             if self.training:
                 hard_batch_usage = torch.bincount(hard_idx, minlength=self.nb_class).float().detach()
@@ -134,6 +162,10 @@ class Tail_Anchor(nn.Module):
 
         else:
             # Hard Anchor only (FedTA baseline when soft_anchor=False)
+            hard_idx = routing_sim.argmax(dim=1)
+            hard_anchor = anchor_pool_raw[hard_idx]
+            routing_logits = routing_sim  # for PCR loss compatibility
+
             anchor_feat = hard_anchor
 
             if self.training:
@@ -145,11 +177,15 @@ class Tail_Anchor(nn.Module):
             if self.training:
                 self.anchor_usage += attn_weights.sum(dim=0).detach().to(self.anchor_usage.device)
 
-        # ---- 5. classifier ----
+        # ---- 3. Hard-key pull (FedTA baseline, unchanged) ----
+        batched_key_norm = key_norm[hard_idx]
+        reduce_sim = torch.sum(x_embed_norm * batched_key_norm.squeeze(1)) / self.key_size
+
+        # ---- 4. classifier ----
         output_mixed = torch.stack((x, anchor_feat), dim=1).view(-1, self.key_size * 2)
         logits = self.head(output_mixed)
 
-        return logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx
+        return logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx, routing_logits
 
     def compute_similarity(self, x):
         x_norm = self.l2_normalize(x, dim=1)
