@@ -111,6 +111,7 @@ class Client_DF:
         self.adaptive_gamma = getattr(args, 'adaptive_gamma', False)
         self.gamma_max = getattr(args, 'gamma_max', 0.35)
         self.use_diff_retrieval = getattr(args, 'use_diff_retrieval', False)
+        self.use_task_isolated_diff = getattr(args, 'use_task_isolated_diff', False)
         self.use_gpa = getattr(args, 'use_gpa', False)
         self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
         self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
@@ -189,6 +190,7 @@ class Client_DF:
                 adaptive_gamma=self.adaptive_gamma,
                 gamma_max=self.gamma_max,
                 use_diff_retrieval=self.use_diff_retrieval,
+                use_task_isolated_diff=self.use_task_isolated_diff,
             )
 
     def _init_log_file(self):

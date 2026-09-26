@@ -190,6 +190,8 @@ def get_args_parser(subparsers):
                             help='原型相似度温度 τ_P')
     subparsers.add_argument('--use_diff_retrieval', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用 Gradient-Decoupled Differentiable Retrieval')
+    subparsers.add_argument('--use_task_isolated_diff', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='TIDR: only current-task keys receive CE gradient through differentiable retrieval')
     subparsers.add_argument('--adaptive_gamma', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用置信度门控的自适应 γ')
     subparsers.add_argument('--gamma_max', default=0.35, type=float,

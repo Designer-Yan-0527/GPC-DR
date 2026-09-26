@@ -25,7 +25,8 @@ class Tail_Anchor(nn.Module):
                  proto_temperature=0.10,
                  adaptive_gamma=False,
                  gamma_max=0.35,
-                 use_diff_retrieval=False):
+                 use_diff_retrieval=False,
+                 use_task_isolated_diff=False):
         super(Tail_Anchor, self).__init__()
         self.size = anchor_size
         self.key_size = key_size
@@ -46,6 +47,7 @@ class Tail_Anchor(nn.Module):
         self.adaptive_gamma = adaptive_gamma
         self.gamma_max = gamma_max
         self.use_diff_retrieval = use_diff_retrieval
+        self.use_task_isolated_diff = use_task_isolated_diff
 
         self.temp_min = 0.03
         self.temp_max = max(soft_temperature, 0.5)
@@ -136,15 +138,62 @@ class Tail_Anchor(nn.Module):
                 )
                 routing_logits = routing_logits + proto_bonus
 
+            # ============================================================
+            # TIDR: Forward-global, Backward-task-isolated retrieval
+            # ============================================================
+            attn_logits = routing_logits
+
+            if (
+                self.use_diff_retrieval
+                and self.use_task_isolated_diff
+                and proto_calib_mask is not None
+            ):
+                # proto_calib_mask 在当前代码中就是 evaluated/current task class mask
+                grad_mask = proto_calib_mask.to(
+                    device=routing_logits.device,
+                    dtype=routing_logits.dtype
+                ).unsqueeze(0)
+
+                # Forward:
+                #   attn_logits == routing_logits
+                #
+                # Backward:
+                #   gradient only passes through current-task columns
+                attn_logits = (
+                    routing_logits.detach()
+                    + (routing_logits - routing_logits.detach()) * grad_mask
+                )
+
             # ---- Soft attention ----
             if self.use_sparse_softmax and self.top_k_anchor is not None:
-                top_k = min(self.top_k_anchor, routing_logits.shape[1])
-                topk_logits, topk_idx = torch.topk(routing_logits, k=top_k, dim=1)
-                soft_attn = torch.zeros_like(routing_logits)
-                soft_attn.scatter_(1, topk_idx, torch.softmax(topk_logits, dim=1))
-                soft_attn = soft_attn / (soft_attn.sum(dim=1, keepdim=True) + 1e-8)
+                top_k = min(
+                    self.top_k_anchor,
+                    attn_logits.shape[1]
+                )
+
+                topk_logits, topk_idx = torch.topk(
+                    attn_logits,
+                    k=top_k, dim=1
+                )
+
+                soft_attn = torch.zeros_like(attn_logits)
+
+                soft_attn.scatter_(
+                    1,
+                    topk_idx,
+                    torch.softmax(topk_logits, dim=1)
+                )
+
+                soft_attn = soft_attn / (
+                    soft_attn.sum(dim=1, keepdim=True)
+                    + 1e-8
+                )
+
             else:
-                soft_attn = torch.softmax(routing_logits, dim=1)
+                soft_attn = torch.softmax(
+                    attn_logits,
+                    dim=1
+                )
 
             # ---- Retrieval: differentiable vs legacy ----
             if self.use_diff_retrieval:

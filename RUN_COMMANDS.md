@@ -152,6 +152,35 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_proto_calibration=False --use_gpa=False
 ```
 
+### E6a-v2. Task-Isolated Differentiable Retrieval
+
+```bash
+python main.py cifar100_delay \
+  --batch-size 16 \
+  --data-path ./local_datasets/ \
+  --data_name cifar100 \
+  --output_dir ./output/cifar100_e6a_v2 \
+  --use_soft_anchor=True \
+  --soft_temperature=0.17 \
+  --soft_anchor_ratio=0.25 \
+  --use_route_loss=True \
+  --route_temperature=0.1 \
+  --lambda_route=0.05 \
+  --use_msp=True \
+  --msp_diversity_coeff=0.03 \
+  --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.1 \
+  --key_temporal_ratio=0.5 \
+  --msp_coherence_coeff=0.0 \
+  --use_diff_retrieval=True \
+  --use_task_isolated_diff=True \
+  --adaptive_gamma=False \
+  --use_proto_replay=False \
+  --use_seen_routing=False \
+  --use_proto_calibration=False \
+  --use_gpa=False
+```
+
 ### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
 
 ```bash
