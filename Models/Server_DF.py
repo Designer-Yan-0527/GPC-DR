@@ -148,6 +148,12 @@ class Server_DF(object):
             parts.append('Proto')
         if getattr(self.args, 'use_seen_routing', False):
             parts.append('SeenRoute')
+        if getattr(self.args, 'use_diff_retrieval', False):
+            parts.append('Diff')
+        if getattr(self.args, 'use_proto_calibration', False):
+            parts.append('GPC')
+        if getattr(self.args, 'use_gpa', False):
+            parts.append('GPA')
 
         parts.append(dataset)
         return '_'.join(parts) + '.csv'

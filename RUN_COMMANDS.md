@@ -42,7 +42,8 @@
 | E6a (+DiffRetrieval) | ✓ | ✓ | ✓ | | | *Diff. Retrieval |
 | E6b (GPC-DR) | ✓ | PCR | ✓ | | | *Full GPC-DR |
 
-\* E6a: adaptive_gamma + anchor_pool.detach(); E6b: + proto_calibration + GPA
+\* E6a: Gradient-Decoupled Differentiable Retrieval only (fixed γ, no proto calib, no GPA)
+\* E6b: E6a + Prototype-Calibrated Soft Routing + Adaptive Gamma + PCR + GPA
 
 ---
 
@@ -254,7 +255,8 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
   --msp_coherence_coeff=0.0 \
-  --adaptive_gamma=True --gamma_max=0.30 \
+  --use_diff_retrieval=True \
+  --adaptive_gamma=False \
   --use_proto_replay=False --use_seen_routing=False \
   --use_proto_calibration=False --use_gpa=False
 ```
@@ -269,8 +271,8 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
   --msp_coherence_coeff=0.0 \
-  --adaptive_gamma=True --gamma_max=0.30 \
   --use_diff_retrieval=True \
+  --adaptive_gamma=True --gamma_max=0.30 \
   --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
   --lambda_pcr=0.05 \
   --use_gpa=True --lambda_gpa=0.2 \
@@ -301,7 +303,7 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
 | **GPC-DR** | `--use_proto_calibration` | True (E6b) | True (E6b) | Proto-calibrated routing |
 | Proto β | `--proto_beta` | 0.5 | 0.5 | 原型路由权重 |
 | Proto τ | `--proto_temperature` | 0.10 | 0.10 | 原型相似度温度 |
-| Adaptive γ | `--adaptive_gamma` | True (E6a+) | True (E6a+) | 置信度门控 |
+| Adaptive γ | `--adaptive_gamma` | True (E6b only) | True (E6b only) | 置信度门控 |
 | γ_max | `--gamma_max` | 0.35 | 0.30 | 自适应γ上限 |
 | GPA | `--use_gpa` | True (E6b) | True (E6b) | Phase1 原型对齐 |
 | GPA 权重 | `--lambda_gpa` | 0.2 | 0.2 | |

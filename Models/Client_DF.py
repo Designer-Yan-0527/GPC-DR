@@ -357,6 +357,8 @@ class Client_DF:
         mask = torch.zeros(self.nb_classes, dtype=torch.bool, device=self.device)
         mask[torch.tensor(self.class_mask[task], dtype=torch.long, device=self.device)] = True
         return mask
+
+    def _compute_route_loss(self, similarity, target, seen_classes):
         """
         FedSMR-v2: 监督路由损失 L_route
 
@@ -498,29 +500,33 @@ class Client_DF:
 
                 # ---- GPC-DR: Global Prototype Alignment (Phase 1, CE form) ----
                 if self.use_gpa and self.global_protos is not None:
-                    gpa_logits_list = []
-                    gpa_target_list = []
-                    feat_norm = F.normalize(feat_prompt, dim=1)
-                    for y_int in self.current_class:
-                        if y_int in self.global_protos:
-                            proto = torch.as_tensor(self.global_protos[y_int],
+                    available_classes = [int(c) for c in self.current_class
+                                         if int(c) in self.global_protos]
+                    if len(available_classes) >= 2:
+                        feat_norm = F.normalize(feat_prompt, dim=1)
+                        proto_list = []
+                        for c in available_classes:
+                            proto = torch.as_tensor(self.global_protos[c],
                                                     dtype=torch.float32,
                                                     device=self.device).view(-1)[:768]
-                            proto_norm = F.normalize(proto.unsqueeze(0), dim=1)
-                            sim = torch.matmul(feat_norm, proto_norm.t()).squeeze(1) / 0.10
-                            gpa_logits_list.append(sim)
-                            gpa_target_list.append(y_int)
-                    if gpa_logits_list:
-                        gpa_logits = torch.stack(gpa_logits_list, dim=1)  # (B, num_proto)
-                        gpa_target = torch.tensor(gpa_target_list, device=self.device, dtype=torch.long)
-                        # map target labels to column indices
-                        proto_to_idx = {c: i for i, c in enumerate(gpa_target_list)}
-                        gpa_labels = torch.tensor(
-                            [proto_to_idx.get(t.item(), 0) for t in target],
-                            device=self.device, dtype=torch.long
+                            proto_list.append(F.normalize(proto, dim=0))
+                        gpa_proto_bank = torch.stack(proto_list, dim=0)
+                        gpa_logits = feat_norm @ gpa_proto_bank.T / self.proto_temperature
+
+                        proto_to_idx = {c: i for i, c in enumerate(available_classes)}
+                        valid_mask = torch.tensor(
+                            [int(t.item()) in proto_to_idx for t in target],
+                            dtype=torch.bool, device=self.device
                         )
-                        gpa_loss = F.cross_entropy(gpa_logits, gpa_labels)
-                        loss = loss + self.lambda_gpa * gpa_loss
+                        if valid_mask.any():
+                            valid_logits = gpa_logits[valid_mask]
+                            valid_targets = target[valid_mask]
+                            gpa_labels = torch.tensor(
+                                [proto_to_idx[int(t.item())] for t in valid_targets],
+                                dtype=torch.long, device=self.device
+                            )
+                            gpa_loss = F.cross_entropy(valid_logits, gpa_labels)
+                            loss = loss + self.lambda_gpa * gpa_loss
                 # ----------------------------------------------------
 
                 optimizer.zero_grad()
@@ -720,9 +726,9 @@ class Client_DF:
                 output = self.vit(input, task_id=self.task_id, cls_features=output,
                                   train=True)
                 proto_bank, proto_valid = self._build_semantic_proto_bank()
-            proto_calib_mask = self._build_proto_calib_mask(self.task_id)
+                proto_calib_mask = self._build_proto_calib_mask(self.task_id)
 
-            _, output_mixed, _, _, _, _, _ = self.model(
+                _, output_mixed, _, _, _, _, _ = self.model(
                     output['feat'].to(self.device), target.to(self.device),
                     proto_bank=proto_bank, proto_valid_mask=proto_valid,
                     proto_calib_mask=proto_calib_mask
