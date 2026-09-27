@@ -104,7 +104,6 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=False --use_seen_routing=False
 ```
 
@@ -117,7 +116,6 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=True --lambda_proto=0.2 \
   --use_seen_routing=False
 ```
@@ -131,7 +129,6 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=True --lambda_proto=0.2 \
   --use_seen_routing=True
 ```
@@ -145,7 +142,6 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --adaptive_gamma=False --gamma_max=0.35 \
   --use_diff_retrieval=True \
   --use_proto_replay=False --use_seen_routing=False \
@@ -171,7 +167,6 @@ python main.py cifar100_delay \
   --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 \
   --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_diff_retrieval=True \
   --use_task_isolated_diff=True \
   --adaptive_gamma=False \
@@ -198,7 +193,6 @@ python main.py cifar100_delay \
 **日常使用直接复制这条即可：**
 
 ```powershell
-python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ --data_name cifar100 --output_dir ./output/cifar100_e6a_v2_diag --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 --msp_coherence_coeff=0.0 --use_diff_retrieval=True --use_task_isolated_diff=True --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False --use_proto_calibration=False --use_gpa=False --run_tidr_diagnostics --save_checkpoints
 ```
 
 #### 方案 B：分步链式运行（PowerShell 整段复制，自动接力、无人值守）
@@ -216,7 +210,7 @@ $common = @(
   '--use_soft_anchor=True','--soft_temperature=0.17','--soft_anchor_ratio=0.25',
   '--use_route_loss=True','--route_temperature=0.1','--lambda_route=0.05',
   '--use_msp=True','--msp_diversity_coeff=0.03','--diversity_margin=0.2',
-  '--msp_temporal_coeff=0.1','--key_temporal_ratio=0.5','--msp_coherence_coeff=0.0',
+  '--msp_temporal_coeff=0.1','--key_temporal_ratio=0.5',
   '--use_diff_retrieval=True','--use_task_isolated_diff=True',
   '--adaptive_gamma=False','--use_proto_replay=False','--use_seen_routing=False',
   '--use_proto_calibration=False','--use_gpa=False'
@@ -243,7 +237,6 @@ Write-Host "E6a-v2-Diag chain finished. Checkpoints: $runDir1 , $runDir2"
 
 ```powershell
 # 公共超参前缀（与方案 B 中 $common 相同的单行展开）
-# python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ --data_name cifar100 --output_dir ./output/cifar100_e6a_v2_diag --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 --msp_coherence_coeff=0.0 --use_diff_retrieval=True --use_task_isolated_diff=True --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False --use_proto_calibration=False --use_gpa=False
 
 # 1) 完整诊断运行（同方案 A）
 #    末尾加: --run_tidr_diagnostics --save_checkpoints
@@ -281,7 +274,6 @@ python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --adaptive_gamma=True --gamma_max=0.35 \
   --use_diff_retrieval=True \
   --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
@@ -333,7 +325,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=False --use_seen_routing=False
 ```
 
@@ -346,7 +337,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=True --lambda_proto=0.3 \
   --use_seen_routing=False
 ```
@@ -360,7 +350,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_proto_replay=True --lambda_proto=0.3 \
   --use_seen_routing=True
 ```
@@ -374,7 +363,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_diff_retrieval=True \
   --adaptive_gamma=False \
   --use_proto_replay=False --use_seen_routing=False \
@@ -390,7 +378,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
   --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
   --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
   --msp_temporal_coeff=0.15 --key_temporal_ratio=0.5 \
-  --msp_coherence_coeff=0.0 \
   --use_diff_retrieval=True \
   --adaptive_gamma=True --gamma_max=0.30 \
   --use_proto_calibration=True --proto_beta=0.5 --proto_temperature=0.10 \
@@ -416,7 +403,6 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
 | Diversity Margin | `--diversity_margin` | 0.2 | 0.2 | |
 | Temporal | `--msp_temporal_coeff` | 0.1 | 0.15 | α_tmp |
 | Key 权重 | `--key_temporal_ratio` | 0.5 | 0.5 | η |
-| Coherence | `--msp_coherence_coeff` | 0.0 | 0.0 | 已禁用 |
 | Proto Replay | `--use_proto_replay` | True (E4+) | True (E4+) | ablation |
 | Proto 权重 | `--lambda_proto` | 0.2 | 0.3 | |
 | Seen Routing | `--use_seen_routing` | True (E5) | True (E5) | ablation |
@@ -471,7 +457,11 @@ done
 
 | 参数 | 原因 |
 |------|------|
+| `--use_soft_prompt / --temperature_anneal / --use_sparse_softmax / --top_k_anchor` | 已废弃方案：Soft Prompt Retrieval / 温度退火 / 稀疏 Softmax，实现代码已一并删除（hard top-k 为唯一路径） |
+| `--use_prompt_mask` | 已废弃方案：task-specific prompt mask，从未在任何实验中启用 |
+| `--msp_coherence_coeff` | Coherence loss 实现已删，参数残留，一并清理 |
+| `--train_mask / --task_inc / --initializer / --global_pool` | 零代码引用的死参数 |
+| `--shared_prompt_pool / --shared_prompt_key / --predefined_key / --pull_constraint / --pull_constraint_coeff` | 零代码引用的死参数 |
 | `--use_head_grad_mask` | per-task head 物理隔离，不需要梯度掩码；且该设计针对 model.head 而非 vit.head |
 | `--use_class_aware_head_agg` | 原始 FedTA 聚合的是 vit.head，不需要 class-aware；model.head 是 per-task 快照 |
 | `--use_fed_smr_aggregate` | 非原始 FedTA 通信协议；将 Tail Anchor 全模型聚合改变了 retrieval + memory + communication 三层 |
-| `--use_soft_prompt / --temperature_anneal / --use_sparse_softmax` | 已废弃 |

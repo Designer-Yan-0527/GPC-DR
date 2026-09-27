@@ -15,8 +15,6 @@ class Tail_Anchor(nn.Module):
     def __init__(self, anchor_size, key_size, nb_class,
                  soft_anchor=True, soft_temperature=0.1,
                  soft_anchor_ratio=0.25,
-                 top_k_anchor=None, temperature_anneal=False,
-                 use_sparse_softmax=False,
                  diversity_margin=0.2,
                  use_seen_routing=False,
                  # GPC-DR
@@ -34,9 +32,6 @@ class Tail_Anchor(nn.Module):
         self.soft_anchor = soft_anchor
         self.soft_temperature = soft_temperature
         self.soft_anchor_ratio = soft_anchor_ratio
-        self.top_k_anchor = top_k_anchor
-        self.temperature_anneal = temperature_anneal
-        self.use_sparse_softmax = use_sparse_softmax
         self.diversity_margin = diversity_margin
         self.use_seen_routing = use_seen_routing
 
@@ -48,9 +43,6 @@ class Tail_Anchor(nn.Module):
         self.gamma_max = gamma_max
         self.use_diff_retrieval = use_diff_retrieval
         self.use_task_isolated_diff = use_task_isolated_diff
-
-        self.temp_min = 0.03
-        self.temp_max = max(soft_temperature, 0.5)
 
         # Hard 使用频率追踪 (argmax-based, 不受 soft attention 污染)
         self.register_buffer('anchor_hard_usage', torch.zeros(nb_class))
@@ -79,12 +71,6 @@ class Tail_Anchor(nn.Module):
         x_inv_norm = torch.rsqrt(torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
         return x * x_inv_norm
 
-    def compute_temperature(self, global_step=None, total_steps=None):
-        if self.temperature_anneal and global_step is not None and total_steps is not None:
-            progress = min(global_step / total_steps, 1.0)
-            return self.temp_min + 0.5 * (self.temp_max - self.temp_min) * (1.0 + np.cos(np.pi * progress))
-        return self.soft_temperature
-
     def _get_routing_similarity(self, similarity):
         """Seen-class routing (controlled by --use_seen_routing)"""
         if not self.use_seen_routing:
@@ -94,7 +80,7 @@ class Tail_Anchor(nn.Module):
             return similarity.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
         return similarity
 
-    def forward(self, x, class_mask, global_step=None, total_steps=None,
+    def forward(self, x, class_mask,
                 proto_bank=None, proto_valid_mask=None, proto_calib_mask=None):
         """
         GPC-DR: Global Prototype-Calibrated Differentiable Retrieval
@@ -120,8 +106,7 @@ class Tail_Anchor(nn.Module):
         hard_anchor = anchor_pool_raw[hard_idx]
 
         if self.soft_anchor:
-            temp = self.compute_temperature(global_step, total_steps)
-            routing_logits = routing_sim / temp
+            routing_logits = routing_sim / self.soft_temperature
 
             # GPC: global prototype-calibrated soft routing (soft branch only)
             if self.use_proto_calibration and proto_bank is not None and proto_valid_mask is not None:
@@ -165,35 +150,10 @@ class Tail_Anchor(nn.Module):
                 )
 
             # ---- Soft attention ----
-            if self.use_sparse_softmax and self.top_k_anchor is not None:
-                top_k = min(
-                    self.top_k_anchor,
-                    attn_logits.shape[1]
-                )
-
-                topk_logits, topk_idx = torch.topk(
-                    attn_logits,
-                    k=top_k, dim=1
-                )
-
-                soft_attn = torch.zeros_like(attn_logits)
-
-                soft_attn.scatter_(
-                    1,
-                    topk_idx,
-                    torch.softmax(topk_logits, dim=1)
-                )
-
-                soft_attn = soft_attn / (
-                    soft_attn.sum(dim=1, keepdim=True)
-                    + 1e-8
-                )
-
-            else:
-                soft_attn = torch.softmax(
-                    attn_logits,
-                    dim=1
-                )
+            soft_attn = torch.softmax(
+                attn_logits,
+                dim=1
+            )
 
             # ---- Retrieval: differentiable vs legacy ----
             if self.use_diff_retrieval:

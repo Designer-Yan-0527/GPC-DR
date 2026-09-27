@@ -11,9 +11,8 @@ ImageNet-R Delay 配置模块
 - 数据增强：color-jitter, aa, smoothing, train-interpolation
 - 随机擦除：reprob, remode, recount
 - 数据参数：data-path, dataset, shuffle, output_dir, device, seed
-- 持续学习：train_mask, task_inc
-- Prompt 参数：size, length, top_k, initializer, prompt_key
-- ViT 参数：global_pool, head_type, freeze
+- Prompt 参数：size, length, top_k, prompt_key
+- ViT 参数：head_type, freeze
 - FedTA 参数：method, client_num, task_num, private_class_num
 """
 
@@ -91,30 +90,17 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--no-pin-mem', action='store_false', dest='pin_mem', help='不固定内存')
     subparsers.set_defaults(pin_mem=True)
 
-    # 持续学习参数
-    subparsers.add_argument('--train_mask', default=True, type=bool, help='训练时是否使用类别掩码')
-    subparsers.add_argument('--task_inc', default=False, type=bool, help='是否进行任务增量学习')
-
     # Prompt Pool 参数
     subparsers.add_argument('--size', default=100, type=int, help='Prompt 池大小')
     subparsers.add_argument('--length', default=10, type=int, help='Prompt 长度')
     subparsers.add_argument('--top_k', default=1, type=int, help='选择的 Prompt 数量')
-    subparsers.add_argument('--initializer', default='uniform', type=str, help='初始化方法')
     subparsers.add_argument('--prompt_key', default=True, type=bool, help='是否使用 Prompt 键')
     subparsers.add_argument('--prompt_key_init', default='uniform', type=str, help='Prompt 键初始化')
-    subparsers.add_argument('--use_prompt_mask', default=False, type=bool, help='是否使用 Prompt 掩码')
-    subparsers.add_argument('--shared_prompt_pool', default=False, type=bool, help='是否共享 Prompt 池')
-    subparsers.add_argument('--shared_prompt_key', default=False, type=bool, help='是否共享 Prompt 键')
     subparsers.add_argument('--batchwise_prompt', default=True, type=bool, help='是否批次级 Prompt')
     subparsers.add_argument('--embedding_key', default='cls', type=str, help='嵌入键类型')
-    subparsers.add_argument('--predefined_key', default='', type=str, help='预定义键')
-    subparsers.add_argument('--pull_constraint', default=True, help='是否使用拉约束')
-    subparsers.add_argument('--pull_constraint_coeff', default=0.1, type=float, help='拉约束系数')
 
     # ViT 参数
-    subparsers.add_argument('--global_pool', default='token', choices=['token', 'avg'], type=str, 
-                           help='全局池化类型')
-    subparsers.add_argument('--head_type', default='prompt', choices=['token', 'gap', 'prompt', 'token+prompt'], 
+    subparsers.add_argument('--head_type', default='prompt', choices=['token', 'gap', 'prompt', 'token+prompt'],
                            type=str, help='分类头输入类型')
     subparsers.add_argument('--freeze', default=['blocks', 'patch_embed', 'cls_token', 'norm', 'pos_embed'], 
                            nargs='*', type=list, help='冻结的模型部分')
@@ -163,8 +149,6 @@ def get_args_parser(subparsers):
                             help='Seen-Only Diversity 系数（v2: 建议0.03）')
     subparsers.add_argument('--diversity_margin', default=0.2, type=float,
                             help='Diversity margin: cos>margin才惩罚')
-    subparsers.add_argument('--msp_coherence_coeff', default=0.0, type=float,
-                            help='Coherence 系数（v2: 默认关闭）')
     subparsers.add_argument('--msp_temporal_coeff', default=0.15, type=float,
                             help='Key+Anchor Temporal Stability 系数')
     subparsers.add_argument('--key_temporal_ratio', default=0.5, type=float,

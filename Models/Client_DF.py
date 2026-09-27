@@ -108,7 +108,6 @@ class Client_DF:
         self.use_msp = getattr(args, 'use_msp', False)
         self.msp_diversity_coeff = getattr(args, 'msp_diversity_coeff', 0.03)
         self.diversity_margin = getattr(args, 'diversity_margin', 0.2)
-        self.msp_coherence_coeff = getattr(args, 'msp_coherence_coeff', 0.0)
         self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.1)
         self.key_temporal_ratio = getattr(args, 'key_temporal_ratio', 0.5)
         # Proto Replay
@@ -126,11 +125,6 @@ class Client_DF:
         self.use_gpa = getattr(args, 'use_gpa', False)
         self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
         self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
-        # 已废弃保留
-        self.use_soft_prompt = getattr(args, 'use_soft_prompt', False)
-        self.use_sparse_softmax = getattr(args, 'use_sparse_softmax', False)
-        self.top_k_anchor = getattr(args, 'top_k_anchor', None)
-        self.temperature_anneal = getattr(args, 'temperature_anneal', False)
         # -------------------------------------------------------------------
 
         self.model = self._init_local_model(model_name)
@@ -204,9 +198,6 @@ class Client_DF:
                 soft_anchor=self.use_soft_anchor,
                 soft_temperature=self.soft_temperature,
                 soft_anchor_ratio=self.soft_anchor_ratio,
-                top_k_anchor=self.top_k_anchor,
-                temperature_anneal=self.temperature_anneal,
-                use_sparse_softmax=self.use_sparse_softmax,
                 diversity_margin=self.diversity_margin,
                 use_seen_routing=self.use_seen_routing,
                 # GPC-DR
@@ -693,7 +684,6 @@ class Client_DF:
 
                 pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx, routing_logits = self.model(
                     feat_prompt.to(self.device), target.to(self.device),
-                    global_step=global_step, total_steps=total_steps * 2,
                     proto_bank=proto_bank, proto_valid_mask=proto_valid,
                     proto_calib_mask=proto_calib_mask
                 )

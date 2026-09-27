@@ -144,8 +144,6 @@ def main(args):
         batchwise_prompt=args.batchwise_prompt,
         prompt_key_init=args.prompt_key_init,
         head_type=args.head_type,
-        use_prompt_mask=args.use_prompt_mask,
-        use_soft_prompt=args.use_soft_prompt
     )
 
     # Load pretrained weights

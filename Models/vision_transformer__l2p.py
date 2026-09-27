@@ -340,8 +340,7 @@ class VisionTransformer(nn.Module):
             class_token=True, no_embed_class=False, fc_norm=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
             weight_init='', embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block,
             prompt_length=None, embedding_key='cls', prompt_init='uniform', prompt_pool=False, prompt_key=False, pool_size=None,
-            top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token', use_prompt_mask=False,
-            use_soft_prompt=False, prompt_temperature=0.1,):
+            top_k=None, batchwise_prompt=False, prompt_key_init='uniform', head_type='token',):
         """
         Args:
             img_size (int, tuple): input image size
@@ -391,9 +390,6 @@ class VisionTransformer(nn.Module):
         self.batchwise_prompt = batchwise_prompt
         self.prompt_key_init = prompt_key_init
         self.prompt_init = prompt_init
-        self.use_soft_prompt = use_soft_prompt
-        self.prompt_temperature = prompt_temperature
-
 
 
         # 把图片划分为patch
@@ -413,7 +409,6 @@ class VisionTransformer(nn.Module):
 
         self.prompt_pool = prompt_pool
         self.head_type = head_type
-        self.use_prompt_mask = use_prompt_mask
         # print('im l2p transformer')
         if prompt_length is not None and pool_size is not None and prompt_pool: 
             self.prompt = Global_Prompt(length=prompt_length, embed_dim=embed_dim, embedding_key=embedding_key, prompt_init=prompt_init,
@@ -486,21 +481,7 @@ class VisionTransformer(nn.Module):
         x = self.patch_embed(x) #把图片切成patch
 
         if hasattr(self, 'prompt'):
-            # 用prompt掩码,可以认为每个task对应end-start的prompt
-            # 这里是task-specific的prompt吗 是的
-            # 判断是否训练过程，训练才能用mask
-            if self.use_prompt_mask and train:
-                start = task_id * self.prompt.top_k
-                end = (task_id + 1) * self.prompt.top_k
-
-                single_prompt_mask = torch.arange(start, end).to(x.device)
-                prompt_mask = single_prompt_mask.unsqueeze(0).expand(x.shape[0], -1)
-
-                if end > self.prompt.pool_size:
-                    prompt_mask = None
-            else:
-                prompt_mask = None
-            res = self.prompt(x, prompt_mask=prompt_mask, cls_features=cls_features)
+            res = self.prompt(x, cls_features=cls_features)
             # 获得patch 长度
             self.total_prompt_len = res['total_prompt_len']
             # 得到加了prompted的特征
@@ -562,9 +543,7 @@ class VisionTransformer(nn.Module):
                                     prompt_init=self.prompt_init,
                                     prompt_pool=self.prompt_pool, prompt_key=self.prompt_key, pool_size=self.pool_size, top_k=self.top_k,
                                     batchwise_prompt=self.batchwise_prompt,
-                                    prompt_key_init=self.prompt_key_init,
-                                    use_soft_prompt=self.use_soft_prompt,
-                                    prompt_temperature=self.prompt_temperature, )
+                                    prompt_key_init=self.prompt_key_init,)
     def load_prompts(self,prompt):
         self.prompt = deepcopy(prompt)
 
