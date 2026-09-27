@@ -1116,6 +1116,8 @@ class Client_DF:
         try:
             # ========================================================
             # 仅恢复旧任务专属 Key
+            # 注意：advanced indexing getitem 返回副本，必须用 setitem
+            # （self.model.key[old_idx].copy_(...) 不会写回 Parameter）
             # ========================================================
             with torch.no_grad():
                 key_before = (
@@ -1126,9 +1128,15 @@ class Client_DF:
                     )
                 )
 
-                self.model.key[old_idx].copy_(
+                self.model.key[old_idx] = (
                     key_before[old_idx]
                 )
+
+                # 写回验证：确认旧 Key 行确实恢复
+                assert torch.equal(
+                    self.model.key.data[old_idx],
+                    key_before[old_idx]
+                ), "[TIDR-KeyCF] rollback write-back failed"
 
             # ========================================================
             # Rollback 后重新评估 Task0
