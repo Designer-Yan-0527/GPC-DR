@@ -31,6 +31,14 @@ from tqdm import tqdm
 
 from Models.Client_DF import Client_DF
 from Models.classification_head import Chead
+from checkpoint_utils import (
+    load_checkpoint,
+    save_checkpoint,
+    DiagStopException,
+    TIDR_DIAG_ROUND,
+    TIDR_DIAG_CLIENT,
+    CKPT_CP1,
+)
 
 from utils import accuracy, global_distillation_loss
 from torch.nn import functional as F
@@ -228,10 +236,11 @@ class Server_DF(object):
 
         return averaged_params
 
-    def train_clients(self):
+    def train_clients(self, start_round=0, resume_mid_round=False,
+                      resume_extras=None):
         """
         协调所有客户端跨任务和轮次的主训练循环
-        
+
         该方法编排：
         - 客户端数据更新
         - 每个客户端的本地训练
@@ -239,9 +248,23 @@ class Server_DF(object):
         - 基于知识蒸馏的提示融合
         - 分类头聚合
         - 向客户端分发全局模型
+
+        E6a-v2-Diag:
+        - start_round: 恢复 CP1 后从 Round5 开始（不重复 Round4）
+        - resume_mid_round + resume_extras: 恢复 CP2 后 Round5 Client0
+          跳过 Phase1 直接进入 Phase2
         """
-        for i in range(self.task_num * self.global_epoch):
+        stop_at = getattr(self.args, 'stop_at_checkpoint', '') or ''
+
+        for i in range(start_round, self.task_num * self.global_epoch):
             self.thisclients = list(range(self.client_num))
+
+            # ---- E6a-v2-Diag: 诊断轮配置注入（Round5 → Client0） ----
+            if i == TIDR_DIAG_ROUND:
+                self._install_tidr_diag_config(
+                    resume_extras if resume_mid_round else None
+                )
+                resume_mid_round = False
 
             # Update client data for the current round
             for j in range(self.client_num):
@@ -256,10 +279,14 @@ class Server_DF(object):
                         self.clients[j].get_data_office_home(self.task_id, datas[j], mask[j])
 
             print(f"--------round {i}, task number {i//self.global_epoch}-----------")
-            
+
             # Train each selected client
             for j in self.thisclients:
                 self.clients[j].train(round=i, args=self.args)
+
+            # E6a-v2-Diag: 诊断配置仅作用于本轮 Client0 的 train()
+            if i == TIDR_DIAG_ROUND:
+                self.clients[TIDR_DIAG_CLIENT]._tidr_diag_config = None
 
             # Select best prototypes using greedy similarity matching
             self.choose_best_proto_greedy_similarity_fixed_key(
@@ -276,7 +303,7 @@ class Server_DF(object):
             self.fed_avg_head(self.thisclients)
 
             print('Server aggregation Complete')
-            
+
             # Distribute global models to clients
             for j in range(self.client_num):
                 if j in self.thisclients:
@@ -288,6 +315,13 @@ class Server_DF(object):
                     self.clients[j].get_global_proto_and_head_no_test(
                         self.global_protos, self.global_head, self.prompt, i
                     )
+
+            # ---- E6a-v2-Diag: CP1（Round4 全部完成后：训练+聚合+融合+分发） ----
+            if i == TIDR_DIAG_ROUND - 1 and getattr(self.args, 'save_checkpoints', False):
+                save_checkpoint(self, 'R4_complete', CKPT_CP1, i)
+                if stop_at == 'R4_complete':
+                    print("[E6a-v2-Diag] Stopped after R4_complete checkpoint")
+                    return
 
         print("All Process completes")
 
@@ -549,9 +583,121 @@ class Server_DF(object):
         return my_result
 
     def start(self):
-        """启动联邦训练过程"""
+        """
+        启动联邦训练过程
+        E6a-v2-Diag: 支持 checkpoint 恢复入口与 --stop_at_checkpoint 停止
+        """
         self.init_client()
-        self.train_clients()
+
+        # ---- E6a-v2-Diag: checkpoint 恢复入口 ----
+        resume_path = getattr(self.args, 'resume_checkpoint', '') or ''
+        resume_point = None
+        resume_extras = None
+        if resume_path:
+            resume_point, resume_extras, _meta = load_checkpoint(self, resume_path)
+
+        # checkpoint 目录（每次运行独立目录，不覆盖其他实验的 Checkpoint）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._ckpt_dir = os.path.join(
+            'checkpoints', 'E6a_v2_diag',
+            f"{getattr(self.args, 'data_name', 'unknown')}"
+            f"_seed{getattr(self.args, 'seed', 42)}_{timestamp}"
+        )
+
+        stop_at = getattr(self.args, 'stop_at_checkpoint', '') or ''
+        if stop_at:
+            print(f"[E6a-v2-Diag] stop_at_checkpoint={stop_at}")
+
+        try:
+            if resume_point == 'R5_C0_post_phase2':
+                # CP3: 仅离线诊断（不训练、不聚合、不保存）
+                self._run_cp3_standalone_diag(resume_extras)
+            elif resume_point == 'R5_C0_pre_phase2':
+                # CP2: Round5 Client0 跳过 Phase1 直接进入 Phase2，随后正常继续
+                self.train_clients(start_round=TIDR_DIAG_ROUND,
+                                   resume_mid_round=True,
+                                   resume_extras=resume_extras)
+            elif resume_point == 'R4_complete':
+                # CP1: 从 Round5 开始，不重复 Round4
+                self.train_clients(start_round=TIDR_DIAG_ROUND)
+            else:
+                self.train_clients()
+        except DiagStopException as e:
+            print(f"[E6a-v2-Diag] Reached stop_at_checkpoint: {e.cp_name}")
+
+    def _install_tidr_diag_config(self, resume_extras=None):
+        """
+        E6a-v2-Diag: 向 Client0 注入诊断配置
+        仅 --run_tidr_diagnostics 开启时生效；CP2 恢复时同时注入
+        Phase2 上下文与诊断快照（key_before / feature_before 等）
+        """
+        if not getattr(self.args, 'run_tidr_diagnostics', False):
+            return
+
+        client0 = self.clients[TIDR_DIAG_CLIENT]
+        client0._tidr_diag_config = {
+            'save': getattr(self.args, 'save_checkpoints', False),
+            'stop_at': getattr(self.args, 'stop_at_checkpoint', '') or '',
+            'ckpt_dir': getattr(self, '_ckpt_dir', None),
+            'server': self,
+            'standalone': False,
+        }
+
+        if resume_extras:
+            # CP2 恢复: 注入 Phase2 上下文与诊断快照
+            client0._resume_phase2_ctx = {
+                'phase2_global_step': resume_extras['phase2_global_step'],
+                'total_steps': resume_extras['total_steps'],
+            }
+            client0._diag_key_before_phase2 = resume_extras.get('key_before_phase2')
+            client0._diag_old_key_mask = resume_extras.get('old_key_mask')
+            client0._diag_feature_before = resume_extras.get('feature_before')
+            client0._diag_feature_samples = resume_extras.get('feature_sample_indices')
+            client0._diag_phase_acc_pre = resume_extras.get('phase_acc_pre') or {}
+            client0._diag_phase_stats_pre = resume_extras.get('phase_stats_pre')
+
+    def _run_cp3_standalone_diag(self, extras):
+        """
+        E6a-v2-Diag: CP3 离线诊断入口
+        直接加载 Phase2 后状态重新评估 Task0（可复现保存时准确率），
+        输出全部诊断；不训练、不聚合、不重新保存 Checkpoint
+        """
+        if not extras:
+            print("[E6a-v2-Diag] CP3 extras 缺失（key_before/key_after），跳过诊断")
+            return
+
+        client0 = self.clients[TIDR_DIAG_CLIENT]
+
+        # ============================================================
+        # CP3 standalone device protection
+        # （Checkpoint 恢复时模块在 CPU 上，诊断前需移回训练设备）
+        # ============================================================
+        client0.model.to(client0.device)
+        client0.vit.to(client0.device)
+
+        if client0.original_model is not None:
+            client0.original_model.to(client0.device)
+            client0.original_model.eval()
+
+        client0._tidr_diag_config = {
+            'save': False,
+            'stop_at': '',
+            'ckpt_dir': None,
+            'server': self,
+            'standalone': True,
+        }
+        client0._diag_key_before_phase2 = extras.get('key_before_phase2')
+        client0._diag_key_after_phase2 = extras.get('key_after_phase2')
+        client0._diag_old_key_mask = extras.get('old_key_mask')
+        client0._diag_feature_before = extras.get('feature_before')
+        client0._diag_feature_samples = extras.get('feature_sample_indices')
+        client0._diag_phase_acc_pre = extras.get('phase_acc_pre') or {}
+        client0._diag_phase_stats_pre = extras.get('phase_stats_pre')
+
+        print(f"[E6a-v2-Diag] CP3 standalone diagnostics "
+              f"(client={TIDR_DIAG_CLIENT}, round={TIDR_DIAG_ROUND})")
+        client0._tidr_diag_phase2_end(TIDR_DIAG_ROUND, self.args)
+        client0._tidr_diag_config = None
 
     def l2_normalize(self, x, dim=None, epsilon=1e-12):
         """

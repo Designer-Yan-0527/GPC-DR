@@ -29,13 +29,24 @@ import numpy as np
 import torch
 from torch import nn
 from torch.autograd import Variable
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 from torch.nn import functional as F
 from tqdm import tqdm
 
 from Models.Tail_Anchor import Tail_Anchor
 from Models.classification_head import Chead
 from utils import CosineSimilarityClassifier
+from checkpoint_utils import (
+    save_checkpoint,
+    DiagStopException,
+    TIDR_DIAG_ROUND,
+    TIDR_DIAG_CLIENT,
+    TIDR_DIAG_TASK,
+    CKPT_CP2,
+    CKPT_CP3,
+    get_rng_state,
+    set_rng_state,
+)
 
 
 class Client_DF:
@@ -159,6 +170,21 @@ class Client_DF:
         else:
             self.log_file = self._init_log_file()
         self.round = 0
+
+        # ---- E6a-v2-Diag: 诊断开关与状态（默认全部关闭，不影响训练） ----
+        self.run_tidr_diagnostics = getattr(args, 'run_tidr_diagnostics', False)
+        self.save_checkpoints = getattr(args, 'save_checkpoints', False)
+        self._tidr_diag_config = None      # 由 Server_DF 在诊断轮注入
+        self._resume_phase2_ctx = None     # CP2 恢复: 直接进入 Phase2
+        self._diag_key_before_phase2 = None
+        self._diag_key_after_phase2 = None
+        self._diag_old_key_mask = None
+        self._diag_feature_before = None
+        self._diag_feature_after = None
+        self._diag_feature_samples = None
+        self._diag_phase_acc_pre = {}
+        self._diag_phase_stats_pre = None
+        self._diag_step_stats = None
 
     def _init_local_model(self, model_name):
         """
@@ -430,6 +456,33 @@ class Client_DF:
         """
         self.original_model.eval()
 
+        # =============================================================
+        # E6a-v2-Diag: CP2 (R5_C0_pre_phase2) 恢复分支
+        # 跳过 setup 与 Phase1（避免重复初始化 / 重复训练 /
+        # vit.load_prompts 用旧 prompt 覆盖已恢复的 Phase1 结果），
+        # 直接进入 Phase2 第一个 batch
+        # =============================================================
+        if self._resume_phase2_ctx is not None:
+            ctx = self._resume_phase2_ctx
+            self._resume_phase2_ctx = None
+            self.set_round(round)
+            self.model.to(self.device)
+            self.vit.to(self.device)
+            train_loader = DataLoader(
+                self.traindata, batch_size=args.batch_size,
+                num_workers=args.num_workers, shuffle=True
+            )
+            print(f'Client {self.id} on Task {self.task_id} is training '
+                  f'(FedSMR, resumed at Phase2)')
+            task_hard_usage = self._run_phase2(
+                round, args, train_loader,
+                global_step=ctx['phase2_global_step'],
+                total_steps=ctx['total_steps'],
+                skip_start_hook=True,
+            )
+            self._post_train(round, args, train_loader, task_hard_usage)
+            return
+
         self.set_round(round)
 
         # 保存上一轮记忆状态（用于 Key+Anchor temporal stability）
@@ -538,10 +591,24 @@ class Client_DF:
                 global_step += 1
 
         # =============================================================
-        # Phase 2: Train classification head + anchor_pool (Soft Anchor + MSP + InfoNCE)
+        # Phase 2 + post（E6a-v2-Diag: 原样搬移至 _run_phase2 / _post_train）
         # =============================================================
+        task_hard_usage = self._run_phase2(round, args, train_loader,
+                                           global_step, total_steps)
+        self._post_train(round, args, train_loader, task_hard_usage)
+
+    def _run_phase2(self, round, args, train_loader, global_step, total_steps,
+                    skip_start_hook=False):
+        """
+        Phase 2: Train classification head + anchor_pool (Soft Anchor + MSP + InfoNCE)
+        （E6a-v2-Diag: 自 train() 原样搬移，训练逻辑不变）
+
+        Args:
+            skip_start_hook: CP2 恢复时跳过 Phase2 开始钩子（快照已在恢复时注入）
+        """
         self.model.train()  # usage 只在训练模式累积
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
+        criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
         # =============================================================
         # E1-Repair v1 diagnostics: sample-weighted accumulation
@@ -570,12 +637,47 @@ class Client_DF:
                         / usage_t0_dev.sum().clamp_min(1e-12)
                     ).item()
 
+        # =============================================================
+        # E6a-v2-Diag: Phase2 开始钩子（CP2 保存点）
+        # 位于 Phase2 全部初始化之后、第一个 batch 之前
+        # =============================================================
+        if self._tidr_diag_config is not None and not skip_start_hook:
+            head_id_before = id(self.model.head)
+
+            self._tidr_diag_phase2_start(round, args, global_step, total_steps)
+
+            # ---- TIDR-Safety: 诊断不得破坏 Phase2 训练结构 ----
+            head_id_after = id(self.model.head)
+            optimizer_param_ids = {
+                id(p)
+                for group in optimizer.param_groups
+                for p in group['params']
+            }
+            head_param_ids = {
+                id(p) for p in self.model.head.parameters()
+            }
+            optimizer_has_current_head = (
+                head_param_ids.issubset(optimizer_param_ids)
+            )
+            print(f"[TIDR-Safety] head_object_preserved={head_id_before == head_id_after} "
+                  f"model_training={self.model.training} "
+                  f"optimizer_has_current_head={optimizer_has_current_head}")
+
+        # E6a-v2-Diag: 优化步数统计（StepDiag，默认关闭时零开销）
+        diag_steps_active = self._tidr_diag_config is not None
+        diag_num_batches = 0
+        diag_num_samples = 0
+
         for epoch in tqdm(range(self.local_epoch)):
             for input, target in train_loader:
                 input = Variable(input, requires_grad=False).to(
                     self.device, non_blocking=True
                 )
                 target = target.long().to(self.device, non_blocking=True)
+
+                if diag_steps_active:
+                    diag_num_batches += 1
+                    diag_num_samples += len(target)
 
                 with torch.no_grad():
                     if self.original_model is not None:
@@ -682,18 +784,21 @@ class Client_DF:
 
                 global_step += 1
 
-        # =============================================================
-        # Save hard-anchor usage across global rounds
-        # =============================================================
-        round_usage = task_hard_usage.detach().cpu()
-
-        if self.task_id not in self.task_anchor_usage:
-            self.task_anchor_usage[self.task_id] = round_usage.clone()
-        else:
-            self.task_anchor_usage[self.task_id] += round_usage
+        # E6a-v2-Diag: StepDiag 统计（仅诊断开启时）
+        if diag_steps_active:
+            self._diag_step_stats = {
+                'phase2_optimizer_steps': diag_num_batches,  # 每个 batch 一次 optimizer.step()
+                'phase2_num_batches': diag_num_batches,
+                'phase2_num_samples': diag_num_samples,
+                'phase2_mean_batch_size': (
+                    diag_num_samples / diag_num_batches if diag_num_batches else 0.0
+                ),
+            }
 
         # =============================================================
         # E1 routing diagnostics (sample-weighted summary)
+        # （E6a-v2-Diag: 依赖 _run_phase2 局部累计量，自 post 段搬移至此；
+        #   可见日志顺序与原实现一致）
         # =============================================================
         if self.task_id >= 1 and self.use_soft_anchor and diag_sample_count > 0:
             entropy = diag_entropy_sum / diag_sample_count
@@ -711,6 +816,71 @@ class Client_DF:
             else:
                 print(f"[E1-Diag] client={self.id} task={self.task_id} "
                       f"entropy={entropy:.4f} max_w={max_weight:.4f}")
+
+        return task_hard_usage
+
+    def _post_train(self, round, args, train_loader, task_hard_usage):
+        """
+        Phase 2 结束后的收尾（E6a-v2-Diag: 自 train() 原样搬移，逻辑不变）
+
+        usage 保存 / TIDR-KeyDiag / 原型提取 / head 快照 / 本地评估 / prompt 保存
+        """
+        # =============================================================
+        # Save hard-anchor usage across global rounds
+        # =============================================================
+        round_usage = task_hard_usage.detach().cpu()
+
+        if self.task_id not in self.task_anchor_usage:
+            self.task_anchor_usage[self.task_id] = round_usage.clone()
+        else:
+            self.task_anchor_usage[self.task_id] += round_usage
+
+        # =============================================================
+        # TIDR-KeyDiag: 本轮训练造成的旧 Key 漂移（旧 Key 是否被改动）
+        # 区分 "新 Key 侵入" vs "旧 Key 被直接破坏"
+        # =============================================================
+        if (
+            self.task_id >= 1
+            and self.prev_key_pool is not None
+            and len(self.old_seen_classes) > 0
+        ):
+            with torch.no_grad():
+                old_idx = torch.tensor(
+                    sorted(self.old_seen_classes),
+                    dtype=torch.long,
+                    device=self.device
+                )
+
+                curr_key = F.normalize(
+                    self.model.key[old_idx], dim=1
+                )
+                prev_key = F.normalize(
+                    self.prev_key_pool.to(self.device)[old_idx], dim=1
+                )
+
+                old_key_cos = (curr_key * prev_key).sum(dim=1)
+                old_key_drift = 1.0 - old_key_cos
+
+                # E6a-v2-Diag: 额外输出 median / p95（仅诊断开启时，避免改变默认日志）
+                extra_fields = ''
+                if self.run_tidr_diagnostics:
+                    drift_sorted = old_key_drift.sort().values
+                    n_drift = drift_sorted.numel()
+                    median_drift = drift_sorted[n_drift // 2].item()
+                    p95_drift = drift_sorted[
+                        min(n_drift - 1, int(0.95 * n_drift))
+                    ].item()
+                    extra_fields = (
+                        f" median_old_key_drift={median_drift:.6f}"
+                        f" p95_old_key_drift={p95_drift:.6f}"
+                    )
+
+                print(
+                    f"[TIDR-KeyDiag] client={self.id} task={self.task_id} "
+                    f"mean_old_key_drift={old_key_drift.mean().item():.6f} "
+                    f"max_old_key_drift={old_key_drift.max().item():.6f}"
+                    f"{extra_fields}"
+                )
 
         # Extract local prototypes from training data
         self.model.eval()  # 评估/原型提取不累积 usage
@@ -755,6 +925,14 @@ class Client_DF:
         self.local_protos = local_protos
         self.heads[self.task_id] = deepcopy(self.model.get_head())
 
+        # =============================================================
+        # E6a-v2-Diag: Phase2 结束钩子
+        # PhaseDiag post / StepDiag / FeatureDiag / KeyCF Rollback /
+        # Classwise CSV / CP3 保存（本地、服务器聚合之前 → Local 范畴）
+        # =============================================================
+        if self._tidr_diag_config is not None:
+            self._tidr_diag_phase2_end(round, args)
+
         # Evaluate after training
         if self.task_id == 0:
             self.evaluate(self.task_id, args.nb_classes,
@@ -766,6 +944,768 @@ class Client_DF:
                           phase="Local Training", notes_prefix="Local evaluation on task")
 
         self.prompts = deepcopy(self.vit.get_prompts())
+
+    # =============================================================
+    # E6a-v2-Diag: 跨任务遗忘机制诊断
+    # （--run_tidr_diagnostics 开启且 Server 注入配置时才执行；
+    #   全程 model.eval() + torch.no_grad()，不产生梯度、不污染训练/聚合）
+    # =============================================================
+
+    def _tidr_diag_phase2_start(self, round, args, global_step, total_steps):
+        """
+        E6a-v2-Diag: Phase2 开始钩子
+        位置: Phase1 结束、Phase2 全部初始化完成、第一个 batch 之前（CP2 保存点）
+        """
+        cfg = self._tidr_diag_config
+
+        # 1) Key 快照 + old_key_mask
+        #    old-key 定义与 TIDR-KeyDiag 完全一致: old_seen_classes
+        #    （= 已见类别 - 当前任务类别，任务间共享类别自动排除）
+        self._diag_key_before_phase2 = self.model.key.data.clone().cpu()
+        old_idx = sorted(self.old_seen_classes)
+        old_key_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
+        if old_idx:
+            old_key_mask[torch.tensor(old_idx, dtype=torch.long)] = True
+        self._diag_old_key_mask = old_key_mask
+
+        # 2) PhaseDiag pre: 用当前 Task1-stage 表示评估 Task0 / Task1
+        #    （评估协议镜像 evaluate(): vit(task_id=self.task_id), heads[task]）
+        acc0_pre, stats0_pre = self._diag_eval_task(0, collect_stats=True)
+        acc1_pre, _ = self._diag_eval_task(1, collect_stats=False)
+        self._diag_phase_acc_pre = {'task0': acc0_pre, 'task1': acc1_pre}
+        self._diag_phase_stats_pre = stats0_pre
+        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} "
+              f"task0_acc_pre_phase2={acc0_pre:.2f} "
+              f"task1_acc_pre_phase2={acc1_pre:.2f}")
+
+        # 3) FeatureDrift: 固定 Task0 测试样本 + Phase2 前特征快照
+        #    （实际参与 Key routing 的 query = vit forward_head 的 feat）
+        if self._diag_feature_samples is None:
+            self._diag_capture_feature_samples()
+        self._diag_feature_before = self._diag_extract_features()
+
+        # 4) CP2 保存
+        if cfg.get('save'):
+            extras = {
+                'key_before_phase2': self._diag_key_before_phase2,
+                'old_key_mask': self._diag_old_key_mask,
+                'phase2_global_step': global_step,
+                'total_steps': total_steps,
+                'phase_acc_pre': dict(self._diag_phase_acc_pre),
+                'phase_stats_pre': self._diag_phase_stats_pre,
+                'feature_before': self._diag_feature_before,
+                'feature_sample_indices': list(self._diag_feature_samples),
+            }
+            save_checkpoint(cfg['server'], 'R5_C0_pre_phase2', CKPT_CP2, round, extras)
+
+        if cfg.get('stop_at') == 'R5_C0_pre_phase2':
+            raise DiagStopException('R5_C0_pre_phase2')
+
+    def _tidr_diag_phase2_end(self, round, args):
+        """
+        E6a-v2-Diag: Phase2 结束钩子（本地、服务器聚合之前 → Local 范畴）
+        PhaseDiag post / StepDiag / FeatureDiag / KeyCF Rollback /
+        Old-Old 诊断（Normal & Rollback）/ Classwise CSV / CP3 保存
+        """
+        cfg = self._tidr_diag_config
+        standalone = bool(cfg.get('standalone'))
+
+        # ---- 1) PhaseDiag post ----
+        acc0_post, stats0_post = self._diag_eval_task(0, collect_stats=True)
+        acc1_post, _ = self._diag_eval_task(1, collect_stats=False)
+        pre = self._diag_phase_acc_pre or {}
+        acc0_pre = pre.get('task0', float('nan'))
+        acc1_pre = pre.get('task1', float('nan'))
+        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} "
+              f"task0_acc_pre_phase2={acc0_pre:.2f} "
+              f"task0_acc_post_phase2={acc0_post:.2f} "
+              f"task0_acc_change={acc0_post - acc0_pre:+.2f} "
+              f"task1_acc_pre_phase2={acc1_pre:.2f} "
+              f"task1_acc_post_phase2={acc1_post:.2f} "
+              f"task1_acc_change={acc1_post - acc1_pre:+.2f}")
+
+        # ---- 2) StepDiag ----
+        if self._diag_step_stats is not None:
+            s = self._diag_step_stats
+            print(f"[TIDR-StepDiag] client={self.id} "
+                  f"phase2_optimizer_steps={s['phase2_optimizer_steps']} "
+                  f"phase2_num_batches={s['phase2_num_batches']} "
+                  f"phase2_num_samples={s['phase2_num_samples']} "
+                  f"phase2_mean_batch_size={s['phase2_mean_batch_size']:.2f}")
+
+        # ---- 3) FeatureDiag（同一批固定 Task0 样本、相同 task_id） ----
+        if self._diag_feature_samples is None:
+            self._diag_capture_feature_samples()
+        self._diag_feature_after = self._diag_extract_features()
+        if self._diag_feature_before is not None:
+            fb = self._diag_feature_before.to(self.device)
+            fa = self._diag_feature_after.to(self.device)
+            drift = 1.0 - F.cosine_similarity(fb, fa, dim=1)
+            d_sorted = drift.sort().values
+            n_d = d_sorted.numel()
+            p95_drift = d_sorted[min(n_d - 1, int(0.95 * n_d))].item()
+            print(f"[TIDR-FeatureDiag] client={self.id} task={self.task_id} "
+                  f"mean_old_feature_drift={drift.mean().item():.6f} "
+                  f"max_old_feature_drift={drift.max().item():.6f} "
+                  f"p95_old_feature_drift={p95_drift:.6f}")
+
+        # ---- 4) KeyCF: Old-Key Rollback 反事实实验 ----
+        acc_normal = acc0_post
+        metrics_normal = self._format_diag_stats(stats0_post) if stats0_post else None
+        if metrics_normal:
+            self._print_diag_stats('TIDR-Diag-Normal', self.id, 0, metrics_normal)
+
+        key_after = self.model.key.data.clone().cpu()
+        self._diag_key_after_phase2 = key_after
+
+        acc_rollback, recovery, restoration_pass = self._diag_key_rollback(acc_normal)
+        print(f"[TIDR-KeyCF] client={self.id} task={self.task_id} "
+              f"acc_normal={acc_normal:.2f} acc_rollback={acc_rollback:.2f} "
+              f"recovery={recovery:+.2f} key_restoration_pass={restoration_pass}")
+
+        # ---- 5) Classwise CSV（原始数据，不做因果解释） ----
+        try:
+            self._diag_write_classwise_csv(self._diag_phase_stats_pre, stats0_post)
+        except Exception as e:
+            print(f"[TIDR-ClasswiseDiag] CSV 写入失败: {e}")
+
+        # ---- 6) CP3 保存（standalone 模式不重复保存） ----
+        if cfg.get('save') and not standalone:
+            extras = {
+                'key_before_phase2': self._diag_key_before_phase2,
+                'key_after_phase2': key_after,
+                'old_key_mask': self._diag_old_key_mask,
+                'phase_acc_pre': dict(self._diag_phase_acc_pre or {}),
+                'phase_acc_post': {'task0': acc0_post, 'task1': acc1_post},
+                'phase_stats_pre': self._diag_phase_stats_pre,
+                'feature_before': self._diag_feature_before,
+                'feature_after': self._diag_feature_after,
+                'feature_sample_indices': list(self._diag_feature_samples or []),
+            }
+            save_checkpoint(cfg['server'], 'R5_C0_post_phase2', CKPT_CP3, round, extras)
+
+        if cfg.get('stop_at') == 'R5_C0_post_phase2' and not standalone:
+            raise DiagStopException('R5_C0_post_phase2')
+
+    def _diag_key_rollback(self, acc_normal):
+        """
+        E6a-v2-Diag: Old-Key Rollback 反事实实验。
+
+        控制变量：
+        - Prompt 不变
+        - Feature representation 不变
+        - Head 不变
+        - Anchor 不变
+        - New-task keys 不变
+        - 只恢复 old-task-exclusive keys（old_seen_classes 定义，共享类已排除）
+
+        结束后无条件恢复完整 Phase2 后 Key。
+        """
+        if (
+            self._diag_key_before_phase2 is None
+            or len(self.old_seen_classes) == 0
+        ):
+            return float('nan'), float('nan'), False
+
+        old_idx = torch.tensor(
+            sorted(self.old_seen_classes),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        # Phase2 后完整 Key 备份
+        key_backup = (
+            self.model.key
+            .detach()
+            .clone()
+        )
+
+        acc_rollback = float('nan')
+        stats_rb = None
+
+        try:
+            # ========================================================
+            # 仅恢复旧任务专属 Key
+            # ========================================================
+            with torch.no_grad():
+                key_before = (
+                    self._diag_key_before_phase2
+                    .to(
+                        device=self.device,
+                        dtype=self.model.key.dtype
+                    )
+                )
+
+                self.model.key[old_idx].copy_(
+                    key_before[old_idx]
+                )
+
+            # ========================================================
+            # Rollback 后重新评估 Task0
+            # ========================================================
+            acc_rollback, stats_rb = (
+                self._diag_eval_task(
+                    0,
+                    collect_stats=True
+                )
+            )
+
+            if stats_rb:
+                self._print_diag_stats(
+                    'TIDR-Diag-Rollback',
+                    self.id,
+                    0,
+                    self._format_diag_stats(stats_rb)
+                )
+
+        finally:
+            # ========================================================
+            # 无论诊断是否成功，恢复完整 Phase2 后 Key
+            # ========================================================
+            with torch.no_grad():
+                self.model.key.copy_(
+                    key_backup
+                )
+
+        # ============================================================
+        # 严格检查恢复是否成功
+        # ============================================================
+        restoration_pass = bool(
+            torch.equal(
+                self.model.key.detach(),
+                key_backup
+            )
+        )
+
+        recovery = (
+            acc_rollback - acc_normal
+            if not np.isnan(acc_rollback)
+            else float('nan')
+        )
+
+        return (
+            acc_rollback,
+            recovery,
+            restoration_pass
+        )
+
+    def _diag_eval_task(self, task, collect_stats=False):
+        """
+        E6a-v2-Diag: 只读、可恢复的确定性单任务评估。
+
+        关键原则：
+        1. 不替换 self.model.head 模块对象（保护 Phase2 optimizer 的参数引用）；
+        2. 诊断结束后恢复 model / vit 的 train-eval 状态；
+        3. 恢复 RNG，避免诊断改变后续训练数据顺序和随机增强；
+        4. DataLoader 使用 shuffle=False；
+        5. 评估协议仍保持：vit(task_id=self.task_id, train=True) + heads[task]。
+
+        Returns:
+            (acc, stats); stats 仅在 collect_stats 且 task < self.task_id 时填充
+        """
+        # ============================================================
+        # 1. 保存进入诊断前的运行状态
+        # ============================================================
+        model_was_training = self.model.training
+        vit_was_training = self.vit.training
+
+        if self.original_model is not None:
+            original_model_was_training = self.original_model.training
+        else:
+            original_model_was_training = None
+
+        # 诊断不能改变后续训练随机轨迹
+        rng_backup = get_rng_state()
+
+        # ============================================================
+        # 2. 原位保存当前 head 参数（只保存 state_dict，不替换 head 对象）
+        # ============================================================
+        head_backup = {
+            k: v.detach().clone()
+            for k, v in self.model.head.state_dict().items()
+        }
+
+        try:
+            # --------------------------------------------------------
+            # 保证 standalone CP3 时设备正确
+            # --------------------------------------------------------
+            self.model.to(self.device)
+            self.vit.to(self.device)
+
+            if self.original_model is not None:
+                self.original_model.to(self.device)
+                self.original_model.eval()
+
+            # Tail Anchor 进入 eval
+            self.model.eval()
+
+            # --------------------------------------------------------
+            # 临时加载被评估任务对应的 head
+            # 关键：原位 load_state_dict，不使用 self.model.load_head()
+            # --------------------------------------------------------
+            if self.heads[task] is not None:
+                self.model.head.load_state_dict(
+                    self.heads[task].state_dict()
+                )
+
+            # --------------------------------------------------------
+            # 固定样本顺序
+            # --------------------------------------------------------
+            test_data = self.test_loader[task]
+
+            loader = DataLoader(
+                test_data,
+                batch_size=8,
+                shuffle=False
+            )
+
+            # GPC/TIDR 所需状态
+            proto_bank, proto_valid = (
+                self._build_semantic_proto_bank()
+            )
+
+            proto_calib_mask = (
+                self._build_proto_calib_mask(task)
+            )
+
+            do_stats = (
+                collect_stats
+                and task < self.task_id
+            )
+
+            stats = (
+                self._init_diag_stats(task)
+                if do_stats
+                else None
+            )
+
+            correct = 0
+            total = 0
+
+            # ========================================================
+            # 3. 正式评估
+            # ========================================================
+            with torch.no_grad():
+
+                for input, target in loader:
+
+                    input = input.to(
+                        self.device,
+                        non_blocking=True
+                    )
+
+                    target = target.to(
+                        self.device,
+                        non_blocking=True
+                    )
+
+                    # -----------------------------------------------
+                    # frozen original ViT features
+                    # -----------------------------------------------
+                    if self.original_model is not None:
+                        output = self.original_model(input)
+                        cls_features = (
+                            output['pre_logits']
+                            .requires_grad_(False)
+                        )
+                    else:
+                        cls_features = None
+
+                    # -----------------------------------------------
+                    # 与当前 evaluate() 保持同一协议：
+                    # 旧任务评估仍使用当前 task-stage prompt
+                    # -----------------------------------------------
+                    output = self.vit(
+                        input,
+                        task_id=self.task_id,
+                        cls_features=cls_features,
+                        train=True
+                    )
+
+                    feat = output['feat'].to(self.device)
+
+                    # -----------------------------------------------
+                    # Tail Anchor inference
+                    # -----------------------------------------------
+                    (
+                        pre,
+                        _,
+                        _,
+                        _,
+                        _,
+                        hard_idx,
+                        _
+                    ) = self.model(
+                        feat,
+                        target,
+                        proto_bank=proto_bank,
+                        proto_valid_mask=proto_valid,
+                        proto_calib_mask=proto_calib_mask
+                    )
+
+                    logits = pre
+
+                    # -----------------------------------------------
+                    # Task-incremental class mask
+                    # -----------------------------------------------
+                    mask = self.class_mask[task]
+
+                    not_mask = np.setdiff1d(
+                        np.arange(self.nb_classes),
+                        mask
+                    )
+
+                    not_mask = torch.tensor(
+                        not_mask,
+                        dtype=torch.int64,
+                        device=self.device
+                    )
+
+                    logits = logits.index_fill(
+                        dim=1,
+                        index=not_mask,
+                        value=float('-inf')
+                    )
+
+                    predicts = torch.max(
+                        logits,
+                        dim=1
+                    )[1]
+
+                    correct += (
+                        predicts == target
+                    ).sum().item()
+
+                    total += len(target)
+
+                    # -----------------------------------------------
+                    # TIDR routing diagnostics
+                    # -----------------------------------------------
+                    if do_stats:
+                        similarity = (
+                            self.model.compute_similarity(feat)
+                        )
+
+                        self._accumulate_diag_stats(
+                            stats,
+                            similarity,
+                            hard_idx,
+                            predicts,
+                            target,
+                            task
+                        )
+
+            acc = (
+                100.0 * correct / max(total, 1)
+            )
+
+            return acc, stats
+
+        finally:
+            # ========================================================
+            # 4. 无论诊断成功还是异常，都必须恢复状态
+            # ========================================================
+
+            # 原位恢复当前 head 参数
+            self.model.head.load_state_dict(
+                head_backup
+            )
+
+            # 恢复进入诊断前的 train/eval 状态
+            self.model.train(model_was_training)
+            self.vit.train(vit_was_training)
+
+            if (
+                self.original_model is not None
+                and original_model_was_training is not None
+            ):
+                self.original_model.train(
+                    original_model_was_training
+                )
+
+            # 最后恢复 RNG
+            set_rng_state(rng_backup)
+
+    def _init_diag_stats(self, task):
+        """E6a-v2-Diag: 初始化单次评估的统计累积器"""
+        eval_classes = [int(c) for c in self.class_mask[task]]
+        eval_class_set = set(eval_classes)
+        # new-only 定义与 evaluate() TIDR-Diag 一致: 当前任务类 - 被评估任务类
+        new_only_classes = [int(c) for c in self.class_mask[self.task_id]
+                            if int(c) not in eval_class_set]
+        return {
+            'eval_classes': eval_classes,
+            'new_only_classes': new_only_classes,
+            'total': 0,
+            'wrong_total': 0,
+            # old-new（与 evaluate() TIDR-Diag 同定义）
+            'old_to_new_collision': 0.0,
+            'old_new_margin_sum': 0.0,
+            'old_new_margin_negative': 0.0,
+            # old-old
+            'old_old_top1_correct': 0.0,
+            'old_old_margin_sum': 0.0,
+            'old_old_margin_negative': 0.0,
+            # 样本级错误分解
+            'wrong_and_correct_old_route': 0.0,
+            'wrong_and_old_old_collision': 0.0,
+            'wrong_and_old_new_collision': 0.0,
+            'correct_and_non_true_route': 0.0,
+            # 类级
+            'per_class_correct': torch.zeros(self.nb_classes),
+            'per_class_total': torch.zeros(self.nb_classes),
+            'per_class_oo_margin_sum': torch.zeros(self.nb_classes),
+        }
+
+    def _accumulate_diag_stats(self, stats, similarity, hard_idx, predicts,
+                               target, task):
+        """
+        E6a-v2-Diag: 样本级统计累积
+        - old-old margin: cos(f, K_y) - max_{c∈旧任务其他类} cos(f, K_c)
+        - old-new margin: cos(f, K_y) - max_{c∈new-only 类} cos(f, K_c)
+        - 每类一个 Key（Tail_Anchor.key 为 [nb_class, key_size]），
+          类别聚合规则与实际推理一致（无需额外聚合）
+        """
+        n = len(target)
+        stats['total'] += n
+
+        eval_idx = torch.tensor(stats['eval_classes'], dtype=torch.long,
+                                device=similarity.device)
+        new_idx = None
+        if stats['new_only_classes']:
+            new_idx = torch.tensor(stats['new_only_classes'], dtype=torch.long,
+                                   device=similarity.device)
+
+        true_score = similarity.gather(1, target.unsqueeze(1)).squeeze(1)
+
+        # ---- old-old ----
+        other_sim = similarity.clone()
+        other_sim.scatter_(1, target.unsqueeze(1), float('-inf'))
+        max_other_old = other_sim[:, eval_idx].max(dim=1).values
+        oo_margin = true_score - max_other_old
+        stats['old_old_margin_sum'] += oo_margin.sum().item()
+        stats['old_old_margin_negative'] += (oo_margin < 0).float().sum().item()
+
+        # old-old top1（被评估旧任务类别集合内部）
+        top1_old = eval_idx[similarity[:, eval_idx].argmax(dim=1)]
+        stats['old_old_top1_correct'] += (top1_old == target).float().sum().item()
+
+        # ---- old-new ----
+        if new_idx is not None:
+            stats['old_to_new_collision'] += torch.isin(
+                hard_idx, new_idx
+            ).float().sum().item()
+            max_new_sim = similarity[:, new_idx].max(dim=1).values
+            on_margin = true_score - max_new_sim
+            stats['old_new_margin_sum'] += on_margin.sum().item()
+            stats['old_new_margin_negative'] += (on_margin < 0).float().sum().item()
+
+        # ---- 样本级错误分解（关联分解，非因果分解） ----
+        final_correct = (predicts == target)
+        route_is_true = (hard_idx == target)
+        route_is_old = torch.isin(hard_idx, eval_idx) & ~route_is_true
+        route_is_new = torch.isin(hard_idx, new_idx) if new_idx is not None \
+            else torch.zeros_like(route_is_true)
+
+        stats['wrong_total'] += (~final_correct).float().sum().item()
+        stats['wrong_and_correct_old_route'] += (
+            (~final_correct) & route_is_true).float().sum().item()
+        stats['wrong_and_old_old_collision'] += (
+            (~final_correct) & route_is_old).float().sum().item()
+        stats['wrong_and_old_new_collision'] += (
+            (~final_correct) & route_is_new).float().sum().item()
+        stats['correct_and_non_true_route'] += (
+            final_correct & ~route_is_true).float().sum().item()
+
+        # ---- 类级 ----
+        for i in range(n):
+            y = int(target[i].item())
+            stats['per_class_total'][y] += 1
+            stats['per_class_correct'][y] += int(bool(final_correct[i]))
+            stats['per_class_oo_margin_sum'][y] += float(oo_margin[i].item())
+
+    @staticmethod
+    def _format_diag_stats(stats):
+        """E6a-v2-Diag: 汇总统计累积器 → 标量指标（含两种比例形式）"""
+        total = max(stats['total'], 1)
+        wrong_total = max(stats['wrong_total'], 1)
+        return {
+            'old_to_new_collision': stats['old_to_new_collision'] / total,
+            'mean_old_new_margin': stats['old_new_margin_sum'] / total,
+            'negative_margin_rate': stats['old_new_margin_negative'] / total,
+            'old_old_top1_accuracy': stats['old_old_top1_correct'] / total,
+            'mean_old_old_margin': stats['old_old_margin_sum'] / total,
+            'negative_old_old_margin_rate': stats['old_old_margin_negative'] / total,
+            'wrong_and_correct_old_route': stats['wrong_and_correct_old_route'] / total,
+            'wrong_and_correct_old_route_of_wrong': stats['wrong_and_correct_old_route'] / wrong_total,
+            'wrong_and_old_old_collision': stats['wrong_and_old_old_collision'] / total,
+            'wrong_and_old_old_collision_of_wrong': stats['wrong_and_old_old_collision'] / wrong_total,
+            'wrong_and_old_new_collision': stats['wrong_and_old_new_collision'] / total,
+            'wrong_and_old_new_collision_of_wrong': stats['wrong_and_old_new_collision'] / wrong_total,
+            'correct_and_non_true_route': stats['correct_and_non_true_route'] / total,
+        }
+
+    @staticmethod
+    def _print_diag_stats(tag, client_id, task, m):
+        """E6a-v2-Diag: 打印完整诊断指标（括号内为占所有分类错误样本的比例）"""
+        print(f"[{tag}] client={client_id} task={task} "
+              f"old_to_new_collision={m['old_to_new_collision']:.4f} "
+              f"mean_old_new_margin={m['mean_old_new_margin']:.4f} "
+              f"negative_margin_rate={m['negative_margin_rate']:.4f} "
+              f"old_old_top1_accuracy={m['old_old_top1_accuracy']:.4f} "
+              f"mean_old_old_margin={m['mean_old_old_margin']:.4f} "
+              f"negative_old_old_margin_rate={m['negative_old_old_margin_rate']:.4f} "
+              f"wrong_and_correct_old_route={m['wrong_and_correct_old_route']:.4f}"
+              f"({m['wrong_and_correct_old_route_of_wrong']:.4f}) "
+              f"wrong_and_old_old_collision={m['wrong_and_old_old_collision']:.4f}"
+              f"({m['wrong_and_old_old_collision_of_wrong']:.4f}) "
+              f"wrong_and_old_new_collision={m['wrong_and_old_new_collision']:.4f}"
+              f"({m['wrong_and_old_new_collision_of_wrong']:.4f}) "
+              f"correct_and_non_true_route={m['correct_and_non_true_route']:.4f}")
+
+    def _diag_capture_feature_samples(self, max_samples=256):
+        """
+        E6a-v2-Diag: 固定 Task0 测试样本
+        取 test_loader[0] Subset 的前 N 个索引（前后两次提取使用完全相同
+        的样本集合与顺序，避免 DataLoader shuffle 对齐问题）
+        """
+        subset = self.test_loader[0]
+        indices = list(subset.indices)
+        self._diag_feature_samples = indices[:min(max_samples, len(indices))]
+
+    def _diag_extract_features(self):
+        """
+        E6a-v2-Diag: 提取实际参与 Key routing 的 query
+        = vit forward_head 输出的 feat（与 Tail_Anchor.key 做 cosine
+        similarity 的表示），调用方式与 evaluate() 完全一致
+        （task_id=self.task_id，不人为切换回 Task0 Prompt）
+
+        特征提取是纯诊断操作：
+        1. 不改变 model / vit / original_model 的 train-eval 状态；
+        2. 不改变外部 RNG 状态；
+        3. 使用固定 Task0 样本和固定顺序；
+        4. 不调用 self.model()，因此完全不碰 Tail Anchor 的 train/eval 状态。
+        """
+        # ============================================================
+        # 保存进入诊断前的状态
+        # ============================================================
+        model_was_training = self.model.training
+        vit_was_training = self.vit.training
+
+        if self.original_model is not None:
+            original_model_was_training = self.original_model.training
+        else:
+            original_model_was_training = None
+
+        rng_backup = get_rng_state()
+
+        try:
+            # ========================================================
+            # 固定 Task0 样本
+            # ========================================================
+            sub = Subset(self.train_data[0], self._diag_feature_samples)
+            loader = DataLoader(sub, batch_size=8, shuffle=False)
+
+            self.vit.to(self.device)
+
+            if self.original_model is not None:
+                self.original_model.to(self.device)
+                self.original_model.eval()
+
+            feats = []
+
+            with torch.no_grad():
+                for input, target in loader:
+                    input = input.to(self.device, non_blocking=True)
+
+                    if self.original_model is not None:
+                        output = self.original_model(input)
+                        cls_features = (
+                            output['pre_logits']
+                            .requires_grad_(False)
+                        )
+                    else:
+                        cls_features = None
+
+                    output = self.vit(
+                        input,
+                        task_id=self.task_id,
+                        cls_features=cls_features,
+                        train=True
+                    )
+
+                    feats.append(
+                        output['feat'].detach().cpu()
+                    )
+
+            if len(feats) == 0:
+                return torch.empty(0, 768)
+
+            return torch.cat(feats, dim=0)
+
+        finally:
+            # ========================================================
+            # 完整恢复进入诊断前的状态
+            # ========================================================
+            self.model.train(model_was_training)
+            self.vit.train(vit_was_training)
+
+            if (
+                self.original_model is not None
+                and original_model_was_training is not None
+            ):
+                self.original_model.train(original_model_was_training)
+
+            set_rng_state(rng_backup)
+
+    def _diag_write_classwise_csv(self, stats_pre, stats_post):
+        """
+        E6a-v2-Diag: 类级诊断 CSV（只输出原始数据，不在代码里宣称因果）
+        列: class_id / class_key_drift / class_acc_pre_phase2 /
+            class_acc_post_phase2 / class_acc_drop /
+            class_old_old_margin_pre / class_old_old_margin_post
+        """
+        if stats_post is None or self._diag_key_before_phase2 is None \
+                or self._diag_key_after_phase2 is None:
+            return
+
+        os.makedirs('diagnostics', exist_ok=True)
+        path = os.path.join('diagnostics', 'E6a_v2_R5_C0_classwise.csv')
+
+        kb = F.normalize(self._diag_key_before_phase2.to(self.device), dim=1)
+        ka = F.normalize(self._diag_key_after_phase2.to(self.device), dim=1)
+
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'class_id', 'class_key_drift',
+                'class_acc_pre_phase2', 'class_acc_post_phase2',
+                'class_acc_drop',
+                'class_old_old_margin_pre', 'class_old_old_margin_post',
+            ])
+            for c in sorted(self.old_seen_classes):
+                drift = (1.0 - (kb[c] * ka[c]).sum()).item()
+                acc_pre = oo_pre = acc_post = oo_post = None
+                for st, which in ((stats_pre, 'pre'), (stats_post, 'post')):
+                    if st is not None and st['per_class_total'][c] > 0:
+                        t = st['per_class_total'][c].item()
+                        acc = 100.0 * st['per_class_correct'][c].item() / t
+                        oo = st['per_class_oo_margin_sum'][c].item() / t
+                        if which == 'pre':
+                            acc_pre, oo_pre = acc, oo
+                        else:
+                            acc_post, oo_post = acc, oo
+                drop = (acc_pre - acc_post) \
+                    if (acc_pre is not None and acc_post is not None) else None
+                writer.writerow([
+                    c, f"{drift:.6f}",
+                    f"{acc_pre:.2f}" if acc_pre is not None else '',
+                    f"{acc_post:.2f}" if acc_post is not None else '',
+                    f"{drop:+.2f}" if drop is not None else '',
+                    f"{oo_pre:.4f}" if oo_pre is not None else '',
+                    f"{oo_post:.4f}" if oo_post is not None else '',
+                ])
+        print(f"[TIDR-ClasswiseDiag] saved: {path}")
 
     def get_global_proto_and_head(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，然后进行评估"""
@@ -866,6 +1806,44 @@ class Client_DF:
         do_hard_diag = (self.use_soft_anchor and task < self.task_id)
         hard_correct = 0
 
+        # TIDR-Diag: 检测旧任务样本被新任务 Key 抢走（new-key invasion）
+        # 仅在评估旧任务时统计
+        do_invasion_diag = (task < self.task_id)
+        old_to_new_collision = 0.0
+        old_new_margin_sum = 0.0
+        old_new_margin_negative = 0.0
+        diag_total = 0
+        if do_invasion_diag:
+            # 用 new-only 类别：当前任务类减去被评估任务类，
+            # 避免任务间共享类别时把共享类误算成 "new-key invasion"
+            eval_classes = set(int(c) for c in self.class_mask[task])
+            new_only_classes = [
+                int(c) for c in self.class_mask[self.task_id]
+                if int(c) not in eval_classes
+            ]
+            if len(new_only_classes) == 0:
+                # 极端情况：当前任务类全部 ⊆ 被评估任务类，无可比的新类
+                do_invasion_diag = False
+            else:
+                current_task_classes = torch.tensor(
+                    new_only_classes,
+                    dtype=torch.long,
+                    device=self.device
+                )
+
+        # E6a-v2-Diag: Old-Old routing 诊断（--run_tidr_diagnostics 开启时）
+        # old-old 类别集合 = 被评估任务自身类别（与 head 掩码一致）
+        do_old_old_diag = (self.run_tidr_diagnostics and task < self.task_id)
+        old_old_top1_correct = 0.0
+        old_old_margin_sum = 0.0
+        old_old_margin_negative = 0.0
+        eval_class_idx = None
+        if do_old_old_diag:
+            eval_class_idx = torch.tensor(
+                [int(c) for c in self.class_mask[task]],
+                dtype=torch.long, device=self.device
+            )
+
         # GPC-DR: proto bank for calibrated evaluation
         proto_bank, proto_valid = self._build_semantic_proto_bank()
         proto_calib_mask = self._build_proto_calib_mask(task)
@@ -881,8 +1859,8 @@ class Client_DF:
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
                     feat = output['feat'].to(self.device)
 
-                # 正常 E1 soft inference
-                pre, _, _, _, _, _, _ = self.model(
+                # 正常 E1 soft inference (TIDR-Diag: 接出 hard_idx)
+                pre, _, _, _, _, hard_idx, _ = self.model(
                     feat, target.to(self.device),
                     proto_bank=proto_bank, proto_valid_mask=proto_valid,
                     proto_calib_mask=proto_calib_mask
@@ -900,6 +1878,56 @@ class Client_DF:
                             )
                     finally:
                         self.model.soft_anchor = original_flag
+
+                # TIDR-Diag: 旧任务样本是否被新任务 Key 抢走
+                if do_invasion_diag or do_old_old_diag:
+                    similarity = self.model.compute_similarity(feat)
+                    diag_total += len(target)
+
+                if do_invasion_diag:
+                    # (1) hard routing collision: hard_idx 落在当前任务类索引上
+                    old_to_new_collision += torch.isin(
+                        hard_idx, current_task_classes
+                    ).float().sum().item()
+
+                    # (2) margin: cos(f, K_y) - max_{c in C_new} cos(f, K_c)
+                    correct_sim = similarity.gather(
+                        1, target.unsqueeze(1)
+                    ).squeeze(1)
+                    max_new_sim = similarity[
+                        :, current_task_classes
+                    ].max(dim=1).values
+                    margin = correct_sim - max_new_sim
+
+                    old_new_margin_sum += margin.sum().item()
+                    old_new_margin_negative += (
+                        margin < 0
+                    ).float().sum().item()
+
+                # E6a-v2-Diag: old-old margin
+                # true_score - max_{c∈被评估任务其他类} cos(f, K_c)
+                if do_old_old_diag:
+                    true_score = similarity.gather(
+                        1, target.unsqueeze(1)
+                    ).squeeze(1)
+                    other_sim = similarity.clone()
+                    other_sim.scatter_(1, target.unsqueeze(1), float('-inf'))
+                    max_other_old = other_sim[
+                        :, eval_class_idx
+                    ].max(dim=1).values
+                    oo_margin = true_score - max_other_old
+                    old_old_margin_sum += oo_margin.sum().item()
+                    old_old_margin_negative += (
+                        oo_margin < 0
+                    ).float().sum().item()
+
+                    # old-old top1（旧任务类别集合内部）
+                    top1_old = eval_class_idx[
+                        similarity[:, eval_class_idx].argmax(dim=1)
+                    ]
+                    old_old_top1_correct += (
+                        top1_old == target
+                    ).float().sum().item()
 
             # Soft accuracy
             logits = pre
@@ -926,6 +1954,27 @@ class Client_DF:
             hard_acc = 100 * hard_correct / total
             print(f"[E1-Diag] Client {self.id}, Task {task}: "
                   f"soft={acc.item():.2f}%, hard={hard_acc.item():.2f}%")
+
+        if self.run_tidr_diagnostics and do_old_old_diag and diag_total > 0:
+            # E6a-v2-Diag: 区分本地训练后 / 服务器聚合后，并附加 old-old 指标
+            # （old-new 三项指标沿用原 TIDR-Diag 定义；若当前任务类全部 ⊆
+            #   被评估任务类，old-new 指标输出 0）
+            scope = 'Global' if ('Aggregation' in phase or 'Global' in phase) else 'Local'
+            print(f"[TIDR-{scope}Diag] Client {self.id}, Task {task}: "
+                  f"old_to_new_collision={old_to_new_collision / diag_total:.4f} "
+                  f"mean_old_new_margin={old_new_margin_sum / diag_total:.4f} "
+                  f"negative_margin_rate={old_new_margin_negative / diag_total:.4f} "
+                  f"old_old_top1_accuracy={old_old_top1_correct / diag_total:.4f} "
+                  f"mean_old_old_margin={old_old_margin_sum / diag_total:.4f} "
+                  f"negative_old_old_margin_rate={old_old_margin_negative / diag_total:.4f}")
+        elif do_invasion_diag and diag_total > 0:
+            old_to_new_rate = old_to_new_collision / diag_total
+            mean_margin = old_new_margin_sum / diag_total
+            neg_rate = old_new_margin_negative / diag_total
+            print(f"[TIDR-Diag] Client {self.id}, Task {task}: "
+                  f"old_to_new_collision={old_to_new_rate:.4f} "
+                  f"mean_old_new_margin={mean_margin:.4f} "
+                  f"negative_margin_rate={neg_rate:.4f}")
 
         self._log_accuracy(acc.item(), f"{notes_prefix} {task}", phase, task_id=task)
 

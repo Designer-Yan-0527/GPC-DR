@@ -203,10 +203,17 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--lambda_pcr', default=0.05, type=float,
                             help='PCR 损失权重 (proto calibration 启用时替代 lambda_route)')
 
-    # -- 已废弃/可选增强 --
-    subparsers.add_argument('--use_soft_prompt', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='[已废弃] Soft Prompt Retrieval')
-    subparsers.add_argument('--use_sparse_softmax', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='[已废弃] Top-K Sparse Softmax')
-    subparsers.add_argument('--temperature_anneal', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='[已废弃] Temperature Annealing')
+    # ===== E6a-v2-Diag: Checkpoint 断点恢复 + 跨任务遗忘诊断（默认全部关闭） =====
+    subparsers.add_argument('--save_checkpoints', action='store_true',
+                            help='保存 CP1/CP2/CP3 三个诊断 Checkpoint（CP2/CP3 需同时开启 --run_tidr_diagnostics）')
+    subparsers.add_argument('--resume_checkpoint', default='', type=str,
+                            help='从指定 Checkpoint 恢复（R4_complete: 从 Round5 开始; '
+                                 'R5_C0_pre_phase2: 跳过 Phase1 直接进入 Phase2; '
+                                 'R5_C0_post_phase2: 仅离线诊断）')
+    subparsers.add_argument('--stop_at_checkpoint', default='',
+                            choices=['', 'R4_complete', 'R5_C0_pre_phase2', 'R5_C0_post_phase2'],
+                            help='保存指定 Checkpoint 后停止训练')
+    subparsers.add_argument('--run_tidr_diagnostics', action='store_true',
+                            help='开启 TIDR 遗忘机制诊断（Round5/Client0/Task1: '
+                                 'PhaseDiag / KeyCF Rollback / Old-Old / FeatureDrift / '
+                                 'StepDiag / Classwise CSV）')

@@ -181,6 +181,97 @@ python main.py cifar100_delay \
   --use_gpa=False
 ```
 
+### E6a-v2-Diag. Checkpoint 断点恢复 + 跨任务遗忘机制诊断
+
+说明：
+
+- 所有新增参数默认关闭；不开启时 E3 / E6a / E6a-v2 行为完全不变。
+- CP1 只依赖 `--save_checkpoints`；CP2 / CP3 的保存与全部诊断依赖 `--run_tidr_diagnostics`。
+- 诊断目标位置固定为 **Round5 / Client0 / Task1**（要求 `--global_epoch=5`，与现有实验一致）。
+- Checkpoint 保存至 `checkpoints/E6a_v2_diag/{dataset}_seed{seed}_{timestamp}/`，
+  每次运行独立目录，不覆盖其他实验（**恢复运行也会新建目录**，CP3 保存在恢复运行的新目录中）。
+- 恢复运行必须使用与原运行**完全相同的超参数**（数据 split 依赖相同 seed）。
+
+#### 方案 A：单次完整诊断运行（最简单，一条命令无人值守）
+
+一次跑完整个训练（Round0-5），保存 CP1/CP2/CP3 并输出全部诊断日志。
+**日常使用直接复制这条即可：**
+
+```powershell
+python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ --data_name cifar100 --output_dir ./output/cifar100_e6a_v2_diag --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 --msp_coherence_coeff=0.0 --use_diff_retrieval=True --use_task_isolated_diff=True --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False --use_proto_calibration=False --use_gpa=False --run_tidr_diagnostics --save_checkpoints
+```
+
+#### 方案 B：分步链式运行（PowerShell 整段复制，自动接力、无人值守）
+
+依次执行：跑到 CP2 停止 → 从 CP2 恢复进入 Phase2 并跑到训练结束 → 从 CP3 离线诊断。
+自动定位每次运行生成的 checkpoint 目录，任一步失败立即中止。
+
+```powershell
+# ===== E6a-v2-Diag 无人值守链式运行（PowerShell，整段复制执行） =====
+# 公共超参（E6a-v2 完整超参，与方案 A 完全一致）
+$common = @(
+  'main.py','cifar100_delay',
+  '--batch-size','16','--data-path','./local_datasets/','--data_name','cifar100',
+  '--output_dir','./output/cifar100_e6a_v2_diag',
+  '--use_soft_anchor=True','--soft_temperature=0.17','--soft_anchor_ratio=0.25',
+  '--use_route_loss=True','--route_temperature=0.1','--lambda_route=0.05',
+  '--use_msp=True','--msp_diversity_coeff=0.03','--diversity_margin=0.2',
+  '--msp_temporal_coeff=0.1','--key_temporal_ratio=0.5','--msp_coherence_coeff=0.0',
+  '--use_diff_retrieval=True','--use_task_isolated_diff=True',
+  '--adaptive_gamma=False','--use_proto_replay=False','--use_seen_routing=False',
+  '--use_proto_calibration=False','--use_gpa=False'
+)
+
+# Step 1: 跑到 CP2（Round5 Client0 Phase2 开始前）保存并停止
+python $common --run_tidr_diagnostics --save_checkpoints --stop_at_checkpoint R5_C0_pre_phase2
+if ($LASTEXITCODE -ne 0) { throw "Step 1 failed (stop at CP2)" }
+
+# Step 2: 定位 Step 1 生成的 run 目录，从 CP2 恢复直接进入 Phase2，跑到训练结束（CP3 存到新目录）
+$runDir1 = Get-ChildItem ./checkpoints/E6a_v2_diag -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+python $common --run_tidr_diagnostics --save_checkpoints --resume_checkpoint "$($runDir1.FullName)/R5_C0_pre_phase2.pth"
+if ($LASTEXITCODE -ne 0) { throw "Step 2 failed (resume from CP2)" }
+
+# Step 3: 定位 Step 2 生成的新 run 目录，从 CP3 做离线诊断（不训练，应复现保存时准确率）
+$runDir2 = Get-ChildItem ./checkpoints/E6a_v2_diag -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+python $common --run_tidr_diagnostics --resume_checkpoint "$($runDir2.FullName)/R5_C0_post_phase2.pth"
+if ($LASTEXITCODE -ne 0) { throw "Step 3 failed (CP3 offline diag)" }
+
+Write-Host "E6a-v2-Diag chain finished. Checkpoints: $runDir1 , $runDir2"
+```
+
+#### 单步命令（手动分步调试用，替换 <run_dir> 为实际目录名）
+
+```powershell
+# 公共超参前缀（与方案 B 中 $common 相同的单行展开）
+# python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ --data_name cifar100 --output_dir ./output/cifar100_e6a_v2_diag --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 --msp_coherence_coeff=0.0 --use_diff_retrieval=True --use_task_isolated_diff=True --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False --use_proto_calibration=False --use_gpa=False
+
+# 1) 完整诊断运行（同方案 A）
+#    末尾加: --run_tidr_diagnostics --save_checkpoints
+
+# 2) 只跑到 CP2（Round5 Client0 Phase2 开始前保存并停止）
+#    末尾加: --run_tidr_diagnostics --save_checkpoints --stop_at_checkpoint R5_C0_pre_phase2
+
+# 3) 从 CP2 恢复，直接进入 Round5 Client0 Phase2（跳过 Round0-4 与 Phase1）
+#    末尾加: --run_tidr_diagnostics --save_checkpoints --resume_checkpoint checkpoints/E6a_v2_diag/<run_dir>/R5_C0_pre_phase2.pth
+
+# 4) 从 CP1 恢复（从 Round5 开始，不重复 Round4）
+#    末尾加: --run_tidr_diagnostics --save_checkpoints --resume_checkpoint checkpoints/E6a_v2_diag/<run_dir>/R4_complete.pth
+
+# 5) 只加载 CP3 做离线诊断（不训练、不聚合；重新评估应复现保存时准确率）
+#    末尾加: --run_tidr_diagnostics --resume_checkpoint checkpoints/E6a_v2_diag/<run_dir>/R5_C0_post_phase2.pth
+```
+
+新增日志：
+
+- `[TIDR-PhaseDiag]` task0/task1 在 Phase2 前后的准确率与变化
+- `[TIDR-StepDiag]` Phase2 优化步数 / batch 数 / 样本数 / 平均 batch 大小
+- `[TIDR-FeatureDiag]` mean/max/p95_old_feature_drift（固定样本，Phase2 前后 query 对比）
+- `[TIDR-Diag-Normal]` / `[TIDR-Diag-Rollback]` 完整 old-new + old-old + 样本级错误分解
+- `[TIDR-KeyCF]` acc_normal / acc_rollback / recovery / key_restoration_pass
+- `[TIDR-LocalDiag]` / `[TIDR-GlobalDiag]` evaluate() 中的 old-new + old-old 指标（本地/聚合后）
+- `[TIDR-KeyDiag]` 追加 median / p95（仅诊断开启时）
+- 类级 CSV：`diagnostics/E6a_v2_R5_C0_classwise.csv`
+
 ### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
 
 ```bash
