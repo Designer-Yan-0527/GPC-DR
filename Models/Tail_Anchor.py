@@ -14,8 +14,7 @@ class Tail_Anchor(nn.Module):
     def __init__(self, anchor_size, key_size, nb_class,
                  soft_anchor=True, soft_temperature=0.1,
                  soft_anchor_ratio=0.25,
-                 diversity_margin=0.2,
-                 use_seen_routing=False):
+                 diversity_margin=0.2):
         super(Tail_Anchor, self).__init__()
         self.size = anchor_size
         self.key_size = key_size
@@ -24,10 +23,6 @@ class Tail_Anchor(nn.Module):
         self.soft_temperature = soft_temperature
         self.soft_anchor_ratio = soft_anchor_ratio
         self.diversity_margin = diversity_margin
-        # use_seen_routing 保留为模型内部属性（RetrievalCF 诊断会临时
-        # 设为 True 并替换 seen_class_mask；MSP diversity 也读 seen_class_mask）。
-        # 不再作为 CLI flag 暴露，默认 False（E3 主线：全类别检索）。
-        self.use_seen_routing = use_seen_routing
 
         # Hard 使用频率追踪 (argmax-based, 不受 soft attention 污染)
         self.register_buffer('anchor_hard_usage', torch.zeros(nb_class))
@@ -43,7 +38,7 @@ class Tail_Anchor(nn.Module):
         # Anchor Pool (raw, 不归一化 — 分类头使用原始模长)
         self.anchor_pool = nn.Parameter(torch.randn(nb_class, key_size))
 
-        # 已见类别掩码 (seen-only diversity + seen-class routing)
+        # 已见类别掩码 (seen-only diversity)
         self.register_buffer('seen_class_mask', torch.zeros(nb_class, dtype=torch.bool))
 
     def set_seen_classes(self, class_indices):
@@ -56,15 +51,6 @@ class Tail_Anchor(nn.Module):
         x_inv_norm = torch.rsqrt(torch.maximum(square_sum, torch.tensor(epsilon, device=x.device)))
         return x * x_inv_norm
 
-    def _get_routing_similarity(self, similarity):
-        """Seen-class routing (controlled by --use_seen_routing)"""
-        if not self.use_seen_routing:
-            return similarity
-        valid_mask = self.seen_class_mask.to(similarity.device)
-        if valid_mask.any():
-            return similarity.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
-        return similarity
-
     def forward(self, x, class_mask):
         """
         E3 plain Residual Soft-Anchor forward.
@@ -75,8 +61,6 @@ class Tail_Anchor(nn.Module):
         - Hard route: always local-key similarity (FedTA baseline)
         - Soft route: residual soft-anchor with stop-gradient on residual
           (legacy E1/E2/E3 path)
-        - routing_logits = routing_sim / soft_temperature，供诊断
-          (RetrievalCF sanity check) 捕获，无 TIDR 梯度隔离。
         """
         # ---- 1. similarity ----
         x_embed_norm = self.l2_normalize(x, dim=1)
@@ -86,7 +70,7 @@ class Tail_Anchor(nn.Module):
         anchor_pool_raw = self.anchor_pool.reshape(-1, self.key_size).to(x.device)
 
         # ---- 2. Hard route: always local-key similarity (FedTA baseline) ----
-        routing_sim = self._get_routing_similarity(similarity)
+        routing_sim = similarity
         hard_idx = routing_sim.argmax(dim=1)
         hard_anchor = anchor_pool_raw[hard_idx]
 

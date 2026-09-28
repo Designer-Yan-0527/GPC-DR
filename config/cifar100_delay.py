@@ -152,26 +152,3 @@ def get_args_parser(subparsers):
                             help='Key+Anchor Temporal Stability 系数')
     subparsers.add_argument('--key_temporal_ratio', default=0.5, type=float,
                             help='Key temporal 在总 temporal loss 中的权重 η')
-
-    # ===== E6a-v2-Diag: Checkpoint 断点恢复 + 跨任务遗忘诊断（默认全部关闭） =====
-    subparsers.add_argument('--save_checkpoints', action='store_true',
-                            help='保存 CP1/CP2/CP3 三个诊断 Checkpoint（CP2/CP3 需同时开启 --run_tidr_diagnostics）')
-    subparsers.add_argument('--resume_checkpoint', default='', type=str,
-                            help='从指定 Checkpoint 恢复（R4_complete: 从 Round5 开始; '
-                                 'R5_C0_pre_phase2: 跳过 Phase1 直接进入 Phase2; '
-                                 'R5_C0_post_phase2: 仅离线诊断）')
-    subparsers.add_argument('--stop_at_checkpoint', default='',
-                            choices=['', 'R4_complete', 'R5_C0_pre_phase2', 'R5_C0_post_phase2'],
-                            help='保存指定 Checkpoint 后停止训练')
-    subparsers.add_argument('--run_tidr_diagnostics', action='store_true',
-                            help='开启 TIDR 遗忘机制诊断（Round5/Client0/Task1: '
-                                 'PhaseDiag / KeyCF Rollback / Old-Old / FeatureDrift / '
-                                 'StepDiag / Classwise CSV）')
-    subparsers.add_argument('--diag_cf_round', default=5, type=int,
-                            help='E6a-v3b-Diag: 完整反事实套件（KeyCF/AnchorCF/NormCF/DirCF/JointCF/'
-                                 'RetrievalCF + CP2/CP3 保存）生效的轮次（默认 5 = Round5/Task1；'
-                                 'Task2 诊断传 10）。其他任务首轮仅输出轻量 PhaseDiag 三点准确率')
-    subparsers.add_argument('--save_task_checkpoints', action='store_true',
-                            help='E6a-v3b-Diag: 每个 Task 边界保存 Checkpoint（Task{k}_start.pth / '
-                                 'Task{k}_C0_post_phase1.pth / Task{k}_C0_post_phase2.pth / '
-                                 'Task{k}_complete.pth，k>=1）')

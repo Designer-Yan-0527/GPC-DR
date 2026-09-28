@@ -31,13 +31,6 @@ from tqdm import tqdm
 
 from Models.Client_DF import Client_DF
 from Models.classification_head import Chead
-from checkpoint_utils import (
-    load_checkpoint,
-    save_checkpoint,
-    DiagStopException,
-    TIDR_DIAG_ROUND,
-    TIDR_DIAG_CLIENT,
-)
 
 from utils import accuracy, global_distillation_loss
 from torch.nn import functional as F
@@ -237,8 +230,7 @@ class Server_DF(object):
 
         return averaged_params
 
-    def train_clients(self, start_round=0, resume_mid_round=False,
-                      resume_extras=None):
+    def train_clients(self, start_round=0):
         """
         协调所有客户端跨任务和轮次的主训练循环
 
@@ -249,83 +241,11 @@ class Server_DF(object):
         - 基于知识蒸馏的提示融合
         - 分类头聚合
         - 向客户端分发全局模型
-
-        E6a-v2-Diag:
-        - start_round: 恢复 CP1 后从 Round5 开始（不重复 Round4）
-        - resume_mid_round + resume_extras: 恢复 CP2 后 Round5 Client0
-          跳过 Phase1 直接进入 Phase2
         """
-        stop_at = getattr(self.args, 'stop_at_checkpoint', '') or ''
-        run_diag = getattr(self.args, 'run_tidr_diagnostics', False)
-        # E6a-v3b-Diag: 完整反事实套件（CF）生效轮（默认 Round5 = Task1 首轮，
-        # Task2 诊断传 --diag_cf_round=10）
-        diag_cf_round = getattr(self.args, 'diag_cf_round', TIDR_DIAG_ROUND)
-        save_task_ckpt = getattr(self.args, 'save_task_checkpoints', False)
-
         for i in range(start_round, self.task_num * self.global_epoch):
             self.thisclients = list(range(self.client_num))
 
             cur_task = i // self.global_epoch
-            task_first_round = (i % self.global_epoch == 0)
-
-            # ---- E6a-v2-Diag / E6a-v3b-Diag: 诊断轮配置注入（Client0） ----
-            # CF 轮（diag_cf_round）: 完整诊断（PhaseDiag + CF 套件 + CP2/CP3）
-            # 其他任务首轮（task_first_round 且 task>=1）: 轻量 PhaseDiag
-            #   （pre_phase1 / post_phase1 / post_phase2 三点准确率 + drift 指标）
-            # mid-round 恢复（CP2 / Task_C0_post_phase1）: Phase2 上下文注入
-            #   与诊断开关解耦（--save_task_checkpoints 可独立恢复 post-P1），
-            #   且恢复起点轮在诊断开启时强制视为 CF 轮（一次性判定，
-            #   不改写 diag_cf_round，保证后续 CF 轮如 Round10 仍生效）
-            mid_round_first = resume_mid_round
-            if resume_mid_round:
-                self._install_phase2_resume_ctx(resume_extras)
-                resume_extras = None
-                resume_mid_round = False
-                is_cf_round = run_diag
-            else:
-                is_cf_round = run_diag and i == diag_cf_round
-            is_phase_diag_round = (
-                run_diag and task_first_round and cur_task >= 1
-                and not is_cf_round
-            )
-            if is_cf_round:
-                self._install_tidr_diag_config(cf=True)
-            elif is_phase_diag_round:
-                self._install_tidr_diag_config(cf=False)
-
-            # ---- E6a-v3b-Diag: Task{k}_start Checkpoint（Task 训练开始前） ----
-            # mid-round 恢复（CP2）首轮不是 Task 边界，跳过
-            if (save_task_ckpt and task_first_round and cur_task >= 1
-                    and not mid_round_first):
-                save_checkpoint(self, 'Task_start',
-                                f'Task{cur_task}_start.pth', i)
-
-            # ---- E6a-v3b-Diag r4: pre-task-switch 同协议基准（Client0） ----
-            # 在 update_data()（task switch）之前，用 _diag_eval_task 的
-            # 固定 seed 协议测全部旧任务 task0..task{cur_task-1}（此时
-            # client.task_id 仍为 cur_task-1，vit 用旧任务 stage——正是
-            # "Task{k-1} stage、上轮结束后"状态）。
-            # 与 post_task_switch_pre_phase1 / post_phase1 / post_phase2
-            # 完全同协议可比，形成 A/B/C/D 四点因果分解：
-            #   A(此处) → B 的差 = task switch 本身的因果贡献
-            #   B → C = Phase1 优化贡献；C → D = Phase2 优化贡献
-            # 测全部旧任务（非仅 Task0）: 若 Task2 边界处 T0 大跌而 T1 几乎
-            # 不掉（如 T0: 89→40, T1: 94→93），强烈支持
-            # "oldest-task-specific transition failure" 而非所有旧任务一起崩。
-            # 注意: 普通 evaluate()（R9 日志的 88.86%）shuffle=True 且无固定
-            # seed，与 A 不可做精确差值；A 才是同协议基准。
-            # 只读测量：不改模型/算法/训练 RNG（_diag_eval_task 自带
-            # RNG 保护、固定诊断 seed 与 train/eval 状态恢复）。
-            # mid-round 恢复轮的 client 状态是恢复中段（非 task 边界），跳过。
-            if (run_diag and task_first_round and cur_task >= 1
-                    and not mid_round_first):
-                parts = []
-                for t in range(0, cur_task):
-                    acc_t = self.clients[TIDR_DIAG_CLIENT] \
-                        ._diag_eval_task(t, collect_stats=False)[0]
-                    parts.append(f"task{t}_acc_pre_task_switch={acc_t:.2f}")
-                print(f"[TIDR-TaskBoundaryDiag] round={i} task={cur_task} "
-                      f"client={TIDR_DIAG_CLIENT} " + ' '.join(parts))
 
             # Update client data for the current round
             for j in range(self.client_num):
@@ -341,23 +261,9 @@ class Server_DF(object):
 
             print(f"--------round {i}, task number {i//self.global_epoch}-----------")
 
-            # ---- E6a-v3b-Diag: Task Checkpoint 配置注入（Client0 Phase 边界保存） ----
-            if save_task_ckpt and task_first_round and cur_task >= 1:
-                self.clients[TIDR_DIAG_CLIENT]._task_ckpt_config = {
-                    'save': True,
-                    'task': cur_task,
-                    'server': self,
-                }
-
             # Train each selected client
             for j in self.thisclients:
                 self.clients[j].train(round=i, args=self.args)
-
-            # E6a-v2-Diag: 诊断配置仅作用于本轮 Client0 的 train()
-            if is_cf_round or is_phase_diag_round:
-                self.clients[TIDR_DIAG_CLIENT]._tidr_diag_config = None
-            if save_task_ckpt and task_first_round and cur_task >= 1:
-                self.clients[TIDR_DIAG_CLIENT]._task_ckpt_config = None
 
             # Select best prototypes using greedy similarity matching
             self.choose_best_proto_greedy_similarity_fixed_key(
@@ -367,7 +273,8 @@ class Server_DF(object):
             )
 
             # Perform prompt fusion via knowledge distillation
-            if i % self.global_epoch != 4:
+            # （Task 最后一轮跳过融合：此时应做 Task 边界处理而非常规轮融合）
+            if (i + 1) % self.global_epoch != 0:
                 self.kd_fusion_prompt(self.thisclients)
 
             # Aggregate classification heads across clients
@@ -391,21 +298,6 @@ class Server_DF(object):
             # （get_global_proto_and_head 内已完成全 seen tasks 评估）
             if (i + 1) % self.global_epoch == 0:
                 self._collect_cl_matrix_rows(cur_task)
-
-            # ---- E6a-v2-Diag: CP1（CF 轮前一轮全部完成后：训练+聚合+融合+分发） ----
-            # E6a-v3b-Diag: 轮次/文件名跟随 diag_cf_round（默认 5 → R4_complete.pth；
-            # Task2 传 10 → R9_complete.pth；resume_point 标签保持 'R4_complete'）
-            if i == diag_cf_round - 1 and getattr(self.args, 'save_checkpoints', False):
-                save_checkpoint(self, 'R4_complete',
-                                f'R{diag_cf_round - 1}_complete.pth', i)
-                if stop_at == 'R4_complete':
-                    print("[E6a-v2-Diag] Stopped after R4_complete checkpoint")
-                    return
-
-            # ---- E6a-v3b-Diag: Task{k}_complete（Task 最后一轮全部完成后） ----
-            if save_task_ckpt and (i + 1) % self.global_epoch == 0:
-                save_checkpoint(self, 'Task_complete',
-                                f'Task{cur_task}_complete.pth', i)
 
         print("All Process completes")
 
@@ -468,8 +360,10 @@ class Server_DF(object):
             # Forgetting / BWT: 只在 matrix 完整（每 task 一行）时计算，
             # 恢复运行产生的部分 matrix 跳过，避免越界/偏差
             if n == num_tasks:
+                # rows[i] 仅包含 task0..i 的准确率（三角形 matrix），
+                # task j 首次出现在 rows[j]，max 从 i=j 起算
                 forgets = [
-                    max(rows[i][j] for i in range(n)) - last[j]
+                    max(rows[i][j] for i in range(j, n)) - last[j]
                     for j in range(num_tasks - 1)
                 ]
                 f_mean = float(np.mean(forgets))
@@ -752,215 +646,9 @@ class Server_DF(object):
     def start(self):
         """
         启动联邦训练过程
-        E6a-v2-Diag: 支持 checkpoint 恢复入口与 --stop_at_checkpoint 停止
         """
         self.init_client()
-
-        # ---- E6a-v2-Diag: checkpoint 恢复入口 ----
-        resume_path = getattr(self.args, 'resume_checkpoint', '') or ''
-        resume_point = None
-        resume_extras = None
-        resume_payload = None
-        if resume_path:
-            resume_point, resume_extras, resume_payload = load_checkpoint(self, resume_path)
-
-        # checkpoint 目录（每次运行独立目录，不覆盖其他实验的 Checkpoint）
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._ckpt_dir = os.path.join(
-            'checkpoints', 'E6a_v2_diag',
-            f"{getattr(self.args, 'data_name', 'unknown')}"
-            f"_seed{getattr(self.args, 'seed', 42)}_{timestamp}"
-        )
-
-        stop_at = getattr(self.args, 'stop_at_checkpoint', '') or ''
-        if stop_at:
-            print(f"[E6a-v2-Diag] stop_at_checkpoint={stop_at}")
-
-        try:
-            if resume_point == 'R5_C0_post_phase2':
-                # CP3: 仅离线诊断（不训练、不聚合、不保存）
-                self._run_standalone_diag(
-                    resume_extras,
-                    round_label=(resume_payload or {}).get(
-                        'round', TIDR_DIAG_ROUND))
-            elif resume_point == 'Task_C0_post_phase2':
-                # E6a-v3b-Diag: Task{k}_C0_post_phase2.pth 离线诊断
-                # （与 CP3 同协议；Task 编号在 extras['diag_task']）
-                self._run_standalone_diag(
-                    resume_extras,
-                    round_label=(resume_extras or {}).get('diag_round',
-                                                          TIDR_DIAG_ROUND)
-                )
-            elif resume_point == 'R5_C0_pre_phase2':
-                # CP2: CF 轮 Client0 跳过 Phase1 直接进入 Phase2，随后正常继续
-                # E6a-v3b-Diag: 恢复起点取自 checkpoint 实际保存轮次
-                self.train_clients(
-                    start_round=(resume_payload or {}).get(
-                        'round', TIDR_DIAG_ROUND),
-                    resume_mid_round=True,
-                    resume_extras=resume_extras)
-            elif resume_point == 'Task_C0_post_phase1':
-                # E6a-v3b-Diag: Task{k}_C0_post_phase1.pth mid-round 恢复
-                # （Phase1 已完成，跳过 Phase1 直接进入 Phase2，与 CP2 同协议；
-                #   不依赖 --run_tidr_diagnostics，与 --save_task_checkpoints 解耦）
-                self.train_clients(
-                    start_round=(resume_payload or {}).get('round', 0),
-                    resume_mid_round=True,
-                    resume_extras=resume_extras)
-            elif resume_point == 'R4_complete':
-                # CP1: 从 CF 轮开始，不重复前一轮
-                self.train_clients(
-                    start_round=(resume_payload or {}).get(
-                        'round', TIDR_DIAG_ROUND - 1) + 1)
-            elif resume_point == 'Task_start':
-                # E6a-v3b-Diag: Task{k}_start.pth 保存于 Round k*ge 循环体开始、
-                # update_data 之前 → 从该 Round 原样继续（数据 split 一致）
-                self.train_clients(
-                    start_round=(resume_payload or {}).get('round', 0)
-                )
-            elif resume_point == 'Task_complete':
-                # Task{k}_complete.pth 保存于 Task 最后一轮全部完成后
-                # → 从下一 Round 继续
-                self.train_clients(
-                    start_round=(resume_payload or {}).get('round', 0) + 1
-                )
-            else:
-                self.train_clients()
-        except DiagStopException as e:
-            print(f"[E6a-v2-Diag] Reached stop_at_checkpoint: {e.cp_name}")
-
-    def _install_tidr_diag_config(self, cf=True):
-        """
-        E6a-v2-Diag / E6a-v3b-Diag: 向 Client0 注入诊断配置
-        仅 --run_tidr_diagnostics 开启时生效。
-        （mid-round 恢复的 Phase2 上下文注入见 _install_phase2_resume_ctx，
-          与本方法解耦，不依赖诊断开关）
-
-        cf=True: 完整反事实套件轮（diag_cf_round，含 CF + CP2/CP3 保存）
-        cf=False: 轻量 PhaseDiag 轮（其他任务首轮，仅三点准确率 + drift）
-        """
-        if not getattr(self.args, 'run_tidr_diagnostics', False):
-            return
-
-        client0 = self.clients[TIDR_DIAG_CLIENT]
-        client0._tidr_diag_config = {
-            'save': getattr(self.args, 'save_checkpoints', False) and cf,
-            'stop_at': (getattr(self.args, 'stop_at_checkpoint', '') or '')
-                       if cf else '',
-            'ckpt_dir': getattr(self, '_ckpt_dir', None),
-            'server': self,
-            'standalone': False,
-            'cf': cf,
-        }
-
-    def _install_phase2_resume_ctx(self, resume_extras):
-        """
-        E6a-v3b-Diag: mid-round 恢复（CP2 / Task{k}_C0_post_phase1）时
-        向 Client0 注入 Phase2 上下文与诊断快照。
-
-        与 --run_tidr_diagnostics 解耦：仅 --save_task_checkpoints 保存的
-        post-P1 checkpoint 也能独立恢复（跳过 Phase1 直接进入 Phase2）。
-        """
-        if not resume_extras:
-            return
-        client0 = self.clients[TIDR_DIAG_CLIENT]
-        client0._resume_phase2_ctx = {
-            'phase2_global_step': resume_extras['phase2_global_step'],
-            'total_steps': resume_extras['total_steps'],
-        }
-        client0._diag_key_before_phase2 = resume_extras.get('key_before_phase2')
-        client0._diag_anchor_before_phase2 = resume_extras.get('anchor_before_phase2')
-        client0._diag_old_key_mask = resume_extras.get('old_key_mask')
-        client0._diag_feature_before = resume_extras.get('feature_before')
-        client0._diag_feature_samples = resume_extras.get('feature_sample_indices')
-        client0._diag_phase_acc_pre = resume_extras.get('phase_acc_pre') or {}
-        # E6a-v3b-Diag: Phase1 前三点准确率（CP2 恢复时 Phase1 已在原运行完成）
-        client0._diag_phase_acc_pre_p1 = (
-            resume_extras.get('phase_acc_pre_p1') or {}
-        )
-        client0._diag_phase_stats_pre = resume_extras.get('phase_stats_pre')
-        # E6a-v3b-Diag: 诊断快照（P1 窗口 drift / 固定输入张量）
-        client0._diag_anchor_feat_before_phase2 = (
-            resume_extras.get('anchor_feat_before_phase2')
-        )
-        client0._diag_feature_pre_p1 = resume_extras.get('feature_pre_p1')
-        client0._diag_anchor_feat_pre_p1 = (
-            resume_extras.get('anchor_feat_pre_p1')
-        )
-        client0._diag_key_pre_p1 = resume_extras.get('key_pre_p1')
-        client0._diag_anchor_pre_p1 = resume_extras.get('anchor_pre_p1')
-        client0._diag_head_pre_p1 = resume_extras.get('head_pre_p1')
-        client0._diag_heads_pre_p1 = resume_extras.get('heads_pre_p1')
-        client0._diag_fixed_inputs = resume_extras.get('fixed_inputs')
-        client0._diag_fixed_targets = resume_extras.get('fixed_targets')
-
-    def _run_cp3_standalone_diag(self, extras):
-        """向后兼容入口（转调 _run_standalone_diag）"""
-        self._run_standalone_diag(extras, round_label=TIDR_DIAG_ROUND)
-
-    def _run_standalone_diag(self, extras, round_label=TIDR_DIAG_ROUND):
-        """
-        E6a-v2-Diag / E6a-v3b-Diag: 离线诊断入口
-        （CP3 或 Task{k}_C0_post_phase2.pth）
-        直接加载 Phase2 后状态重新评估 Task0（可复现保存时准确率），
-        输出全部诊断；不训练、不聚合、不重新保存 Checkpoint
-        """
-        if not extras:
-            print("[E6a-v2-Diag] standalone extras 缺失（key_before/key_after），跳过诊断")
-            return
-
-        client0 = self.clients[TIDR_DIAG_CLIENT]
-
-        # ============================================================
-        # standalone device protection
-        # （Checkpoint 恢复时模块在 CPU 上，诊断前需移回训练设备）
-        # ============================================================
-        client0.model.to(client0.device)
-        client0.vit.to(client0.device)
-
-        if client0.original_model is not None:
-            client0.original_model.to(client0.device)
-            client0.original_model.eval()
-
-        client0._tidr_diag_config = {
-            'save': False,
-            'stop_at': '',
-            'ckpt_dir': None,
-            'server': self,
-            'standalone': True,
-            'cf': True,
-        }
-        client0._diag_key_before_phase2 = extras.get('key_before_phase2')
-        client0._diag_key_after_phase2 = extras.get('key_after_phase2')
-        # 旧 CP3 无此字段 → None → Client_DF 自动 fallback 到 prev_anchor_pool
-        # （prev_anchor_pool 在本轮开始 clone 保存，Phase1 不动 Tail Anchor，
-        #   等价于 Phase2 前 Anchor，可用于 AnchorCF / AnchorDrift）
-        client0._diag_anchor_before_phase2 = extras.get('anchor_before_phase2')
-        client0._diag_old_key_mask = extras.get('old_key_mask')
-        client0._diag_feature_before = extras.get('feature_before')
-        client0._diag_feature_samples = extras.get('feature_sample_indices')
-        client0._diag_phase_acc_pre = extras.get('phase_acc_pre') or {}
-        client0._diag_phase_stats_pre = extras.get('phase_stats_pre')
-        client0._diag_phase_acc_pre_p1 = extras.get('phase_acc_pre_p1') or {}
-        # E6a-v3b-Diag: 诊断快照（P1 窗口 drift / 固定输入张量），
-        # 使离线复跑能完整复现 P1Drift / HeadDrift / RetrievedAnchorDrift
-        client0._diag_anchor_feat_before_phase2 = (
-            extras.get('anchor_feat_before_phase2')
-        )
-        client0._diag_feature_pre_p1 = extras.get('feature_pre_p1')
-        client0._diag_anchor_feat_pre_p1 = extras.get('anchor_feat_pre_p1')
-        client0._diag_key_pre_p1 = extras.get('key_pre_p1')
-        client0._diag_anchor_pre_p1 = extras.get('anchor_pre_p1')
-        client0._diag_head_pre_p1 = extras.get('head_pre_p1')
-        client0._diag_heads_pre_p1 = extras.get('heads_pre_p1')
-        client0._diag_fixed_inputs = extras.get('fixed_inputs')
-        client0._diag_fixed_targets = extras.get('fixed_targets')
-
-        print(f"[E6a-v2-Diag] standalone diagnostics "
-              f"(client={TIDR_DIAG_CLIENT}, round={round_label}, "
-              f"task={extras.get('diag_task', 'n/a')})")
-        client0._tidr_diag_phase2_end(round_label, self.args)
-        client0._tidr_diag_config = None
+        self.train_clients()
 
     def l2_normalize(self, x, dim=None, epsilon=1e-12):
         """
