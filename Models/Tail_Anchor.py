@@ -3,7 +3,6 @@ FedSMR-v2: Tail_Anchor 模型模块 (Residual Soft Anchor + Seen-Only Diversity)
 """
 
 from copy import deepcopy
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,15 +15,7 @@ class Tail_Anchor(nn.Module):
                  soft_anchor=True, soft_temperature=0.1,
                  soft_anchor_ratio=0.25,
                  diversity_margin=0.2,
-                 use_seen_routing=False,
-                 # GPC-DR
-                 use_proto_calibration=False,
-                 proto_beta=0.5,
-                 proto_temperature=0.10,
-                 adaptive_gamma=False,
-                 gamma_max=0.35,
-                 use_diff_retrieval=False,
-                 use_task_isolated_diff=False):
+                 use_seen_routing=False):
         super(Tail_Anchor, self).__init__()
         self.size = anchor_size
         self.key_size = key_size
@@ -33,16 +24,10 @@ class Tail_Anchor(nn.Module):
         self.soft_temperature = soft_temperature
         self.soft_anchor_ratio = soft_anchor_ratio
         self.diversity_margin = diversity_margin
+        # use_seen_routing 保留为模型内部属性（RetrievalCF 诊断会临时
+        # 设为 True 并替换 seen_class_mask；MSP diversity 也读 seen_class_mask）。
+        # 不再作为 CLI flag 暴露，默认 False（E3 主线：全类别检索）。
         self.use_seen_routing = use_seen_routing
-
-        # GPC-DR
-        self.use_proto_calibration = use_proto_calibration
-        self.proto_beta = proto_beta
-        self.proto_temperature = proto_temperature
-        self.adaptive_gamma = adaptive_gamma
-        self.gamma_max = gamma_max
-        self.use_diff_retrieval = use_diff_retrieval
-        self.use_task_isolated_diff = use_task_isolated_diff
 
         # Hard 使用频率追踪 (argmax-based, 不受 soft attention 污染)
         self.register_buffer('anchor_hard_usage', torch.zeros(nb_class))
@@ -80,18 +65,18 @@ class Tail_Anchor(nn.Module):
             return similarity.masked_fill(~valid_mask.unsqueeze(0), float('-inf'))
         return similarity
 
-    def forward(self, x, class_mask,
-                proto_bank=None, proto_valid_mask=None, proto_calib_mask=None):
+    def forward(self, x, class_mask):
         """
-        GPC-DR: Global Prototype-Calibrated Differentiable Retrieval
+        E3 plain Residual Soft-Anchor forward.
 
         Returns: logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx, routing_logits
 
         Design:
-        - Hard route: always local-key similarity (FedTA baseline, never changed by prototypes)
-        - Soft route: can be proto-calibrated (use_proto_calibration)
-        - Differentiable retrieval: q @ A.detach() with hard_anchor.detach() in residual
-          (controlled by use_diff_retrieval, default False = legacy E1/E2/E3 path)
+        - Hard route: always local-key similarity (FedTA baseline)
+        - Soft route: residual soft-anchor with stop-gradient on residual
+          (legacy E1/E2/E3 path)
+        - routing_logits = routing_sim / soft_temperature，供诊断
+          (RetrievalCF sanity check) 捕获，无 TIDR 梯度隔离。
         """
         # ---- 1. similarity ----
         x_embed_norm = self.l2_normalize(x, dim=1)
@@ -108,72 +93,18 @@ class Tail_Anchor(nn.Module):
         if self.soft_anchor:
             routing_logits = routing_sim / self.soft_temperature
 
-            # GPC: global prototype-calibrated soft routing (soft branch only)
-            if self.use_proto_calibration and proto_bank is not None and proto_valid_mask is not None:
-                proto_norm = F.normalize(proto_bank, dim=1)
-                proto_sim = torch.matmul(x_embed_norm, proto_norm.t().to(x.device))
-
-                valid = proto_valid_mask.clone()
-                if proto_calib_mask is not None:
-                    valid = valid & proto_calib_mask
-
-                proto_bonus = torch.zeros_like(routing_logits)
-                proto_bonus[:, valid] = (
-                    self.proto_beta * proto_sim[:, valid] / self.proto_temperature
-                )
-                routing_logits = routing_logits + proto_bonus
-
-            # ============================================================
-            # TIDR: Forward-global, Backward-task-isolated retrieval
-            # ============================================================
-            attn_logits = routing_logits
-
-            if (
-                self.use_diff_retrieval
-                and self.use_task_isolated_diff
-                and proto_calib_mask is not None
-            ):
-                # proto_calib_mask 在当前代码中就是 evaluated/current task class mask
-                grad_mask = proto_calib_mask.to(
-                    device=routing_logits.device,
-                    dtype=routing_logits.dtype
-                ).unsqueeze(0)
-
-                # Forward:
-                #   attn_logits == routing_logits
-                #
-                # Backward:
-                #   gradient only passes through current-task columns
-                attn_logits = (
-                    routing_logits.detach()
-                    + (routing_logits - routing_logits.detach()) * grad_mask
-                )
-
             # ---- Soft attention ----
             soft_attn = torch.softmax(
-                attn_logits,
+                routing_logits,
                 dim=1
             )
 
-            # ---- Retrieval: differentiable vs legacy ----
-            if self.use_diff_retrieval:
-                # Gradient-decoupled: anchor protected, CE → q → Key
-                soft_anchor = torch.matmul(soft_attn, anchor_pool_raw.detach())
-
-                if self.adaptive_gamma:
-                    entropy = -(soft_attn * torch.log(soft_attn.clamp_min(1e-8))).sum(dim=1)
-                    confidence = (1.0 - entropy / np.log(self.nb_class)).clamp(0.0, 1.0).detach()
-                    gamma = (self.gamma_max * confidence).unsqueeze(1)
-                else:
-                    gamma = self.soft_anchor_ratio
-
-                # hard_anchor.detach() preserves ∂a/∂a_h = 1
-                anchor_feat = hard_anchor + gamma * (soft_anchor - hard_anchor.detach())
-            else:
-                # Legacy E1/E2/E3: stop-gradient on full residual
-                soft_anchor = torch.matmul(soft_attn, anchor_pool_raw)
-                soft_residual = (soft_anchor - hard_anchor).detach()
-                anchor_feat = hard_anchor + self.soft_anchor_ratio * soft_residual
+            # Legacy E1/E2/E3: stop-gradient on full residual
+            # Forward: hard + γ·(soft-hard) ≡ (1-γ)·hard + γ·soft
+            # Backward: only hard_anchor receives CE gradient; soft branch detached
+            soft_anchor = torch.matmul(soft_attn, anchor_pool_raw)
+            soft_residual = (soft_anchor - hard_anchor).detach()
+            anchor_feat = hard_anchor + self.soft_anchor_ratio * soft_residual
 
             if self.training:
                 hard_batch_usage = torch.bincount(hard_idx, minlength=self.nb_class).float().detach()
@@ -185,7 +116,7 @@ class Tail_Anchor(nn.Module):
 
         else:
             # Hard Anchor only (FedTA baseline when soft_anchor=False)
-            routing_logits = routing_sim  # for PCR loss compatibility
+            routing_logits = routing_sim
 
             anchor_feat = hard_anchor
 

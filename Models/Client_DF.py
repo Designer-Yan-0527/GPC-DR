@@ -90,6 +90,9 @@ class Client_DF:
 
         self.task_id = -1
         self.task_per_global_epoch = task_per_global_epoch
+        # CL 评估协议: task 末轮全 seen tasks 评估结果暂存
+        # （[after_task, [acc_t,...]]，由 Server 收集写入 cl_matrix CSV）
+        self.cl_matrix_row = None
         self.test_loader = []
         self.train_data = subset
         self.local_epoch = local_epoch
@@ -114,30 +117,11 @@ class Client_DF:
         self.diversity_margin = getattr(args, 'diversity_margin', 0.2)
         self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.1)
         self.key_temporal_ratio = getattr(args, 'key_temporal_ratio', 0.5)
-        # Proto Replay
-        self.use_proto_replay = getattr(args, 'use_proto_replay', False)
-        self.lambda_proto = getattr(args, 'lambda_proto', 0.2)
-        self.use_seen_routing = getattr(args, 'use_seen_routing', False)
-        # GPC-DR
-        self.use_proto_calibration = getattr(args, 'use_proto_calibration', False)
-        self.proto_beta = getattr(args, 'proto_beta', 0.5)
-        self.proto_temperature = getattr(args, 'proto_temperature', 0.10)
-        self.adaptive_gamma = getattr(args, 'adaptive_gamma', False)
-        self.gamma_max = getattr(args, 'gamma_max', 0.35)
-        self.use_diff_retrieval = getattr(args, 'use_diff_retrieval', False)
-        self.use_task_isolated_diff = getattr(args, 'use_task_isolated_diff', False)
-        self.use_gpa = getattr(args, 'use_gpa', False)
-        self.anchor_no_wd = getattr(args, 'anchor_no_wd', False)
-        # E6a-v3b B-实验（最小因果干预，默认关闭 = B0 原样）:
-        #   p2_seen_only:     B1/B3 — Phase2 训练期 Seen-only retrieval
-        #                     （候选空间限制为 T0..T_cur，屏蔽 future keys）
-        #   p2_freeze_old_key: B2/B3 — Phase2 训练期 old-Key freeze
-        #                     （每步 optimizer.step() 后恢复旧 Key 行快照）
-        self.p2_seen_only = getattr(args, 'p2_seen_only', False)
-        self.p2_freeze_old_key = getattr(args, 'p2_freeze_old_key', False)
-        self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
-        self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
         # -------------------------------------------------------------------
+        # use_seen_routing 不再作为 CLI flag（E5 已删除）；模型内部仍保留
+        # use_seen_routing 属性（RetrievalCF 诊断会临时设 True，MSP diversity
+        # 也读 seen_class_mask）。此处固定 False，构造 Tail_Anchor 时传入。
+        self.use_seen_routing = False
 
         self.model = self._init_local_model(model_name)
 
@@ -233,14 +217,6 @@ class Client_DF:
                 soft_anchor_ratio=self.soft_anchor_ratio,
                 diversity_margin=self.diversity_margin,
                 use_seen_routing=self.use_seen_routing,
-                # GPC-DR
-                use_proto_calibration=self.use_proto_calibration,
-                proto_beta=self.proto_beta,
-                proto_temperature=self.proto_temperature,
-                adaptive_gamma=self.adaptive_gamma,
-                gamma_max=self.gamma_max,
-                use_diff_retrieval=self.use_diff_retrieval,
-                use_task_isolated_diff=self.use_task_isolated_diff,
             )
 
     def _init_log_file(self):
@@ -373,43 +349,6 @@ class Client_DF:
 
         return total_msp_loss
 
-    def _build_semantic_proto_bank(self):
-        """GPC-DR: 从 global_protos 提取 prompt-feature prototype bank (前768维)"""
-        bank = torch.zeros(self.nb_classes, 768, device=self.device)
-        valid = torch.zeros(self.nb_classes, dtype=torch.bool, device=self.device)
-
-        if self.global_protos is None:
-            return bank, valid
-
-        for c, proto in self.global_protos.items():
-            proto = torch.as_tensor(proto, dtype=torch.float32, device=self.device).view(-1)
-            if proto.numel() >= 768:
-                bank[int(c)] = proto[:768]
-                valid[int(c)] = True
-
-        return bank, valid
-
-    def _compute_pcr_loss(self, routing_logits, target, seen_classes):
-        """GPC-DR: PCR loss on proto-calibrated routing logits (no extra temperature)"""
-        if len(seen_classes) == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        seen_list = sorted(seen_classes)
-        seen_idx = torch.tensor(seen_list, device=target.device, dtype=torch.long)
-        logits = routing_logits[:, seen_idx]
-        global_to_local = {g: i for i, g in enumerate(seen_list)}
-        local_target = torch.tensor(
-            [global_to_local[int(t.item())] for t in target],
-            device=target.device, dtype=torch.long
-        )
-        return F.cross_entropy(logits, local_target)
-
-    def _build_proto_calib_mask(self, task):
-        """GPC-DR: proto calibration restricted to classes of a specific task"""
-        mask = torch.zeros(self.nb_classes, dtype=torch.bool, device=self.device)
-        mask[torch.tensor(self.class_mask[task], dtype=torch.long, device=self.device)] = True
-        return mask
-
     def _compute_route_loss(self, similarity, target, seen_classes):
         """
         FedSMR-v2: 监督路由损失 L_route
@@ -434,38 +373,6 @@ class Client_DF:
         )
 
         return F.cross_entropy(route_logits, local_target)
-
-    def _compute_proto_replay_loss(self, global_protos):
-        """
-        FedSMR-v2: Global Prototype Head Replay
-
-        用服务器维护的全局原型重放旧类，保护旧类分类边界。
-        """
-        if global_protos is None or len(self.old_seen_classes) == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        old_classes = sorted(self.old_seen_classes)
-        proto_list = []
-        valid_classes = []
-        for c in old_classes:
-            if c in global_protos:
-                proto = global_protos[c]
-                if isinstance(proto, torch.Tensor):
-                    proto = proto.to(self.device)
-                else:
-                    proto = torch.from_numpy(np.array(proto)).float().to(self.device)
-                # proto 是 1536 维 feat_mixed，直接输入 classification head
-                proto_list.append(proto)
-                valid_classes.append(c)
-
-        if len(proto_list) == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        proto_feat = torch.stack(proto_list)               # (N, 1536)
-        proto_target = torch.tensor(valid_classes, device=self.device, dtype=torch.long)
-
-        proto_logits = self.model.head(proto_feat)
-        return F.cross_entropy(proto_logits, proto_target)
 
     def train(self, round, args):
         """
@@ -512,16 +419,18 @@ class Client_DF:
             # P1Drift 无法凭空恢复（不影响 Round10 Task2 诊断）。
             # v3b-Diag r5: 重建条件扩展 —— 旧 checkpoint（r4 及更早代码
             # 保存，fixed tensors 已存在）的 phase_stats_pre 缺少
-            # soft-mass 累积器，SoftMassDiag 会缺 post_p1 基线；B-实验
-            # 从 R10_C0_pre_phase2.pth 恢复时必须同协议重建 stats。
+            # soft-mass 累积器，SoftMassDiag 会缺 post_p1 基线。
             _stats_pre_missing_soft = (
                 not isinstance(self._diag_phase_stats_pre, dict)
                 or 'soft_mass_eval_sum' not in self._diag_phase_stats_pre
             )
+            _need_rebuild_pre_p2 = (
+                self._diag_fixed_inputs is None
+                or self._diag_fixed_targets is None
+                or _stats_pre_missing_soft
+            )
             if (self._diag_feature_samples is not None
-                    and (self._diag_fixed_inputs is None
-                         or self._diag_fixed_targets is None
-                         or _stats_pre_missing_soft)):
+                    and _need_rebuild_pre_p2):
                 self._ensure_diag_fixed_inputs()
                 self._diag_feature_before = self._diag_extract_features()
                 self._diag_anchor_feat_before_phase2 = (
@@ -629,37 +538,6 @@ class Client_DF:
 
                 loss = criterion(logits, target) - 0.1 * pull_off
 
-                # ---- GPC-DR: Global Prototype Alignment (Phase 1, CE form) ----
-                if self.use_gpa and self.global_protos is not None:
-                    available_classes = [int(c) for c in self.current_class
-                                         if int(c) in self.global_protos]
-                    if len(available_classes) >= 2:
-                        feat_norm = F.normalize(feat_prompt, dim=1)
-                        proto_list = []
-                        for c in available_classes:
-                            proto = torch.as_tensor(self.global_protos[c],
-                                                    dtype=torch.float32,
-                                                    device=self.device).view(-1)[:768]
-                            proto_list.append(F.normalize(proto, dim=0))
-                        gpa_proto_bank = torch.stack(proto_list, dim=0)
-                        gpa_logits = feat_norm @ gpa_proto_bank.T / self.proto_temperature
-
-                        proto_to_idx = {c: i for i, c in enumerate(available_classes)}
-                        valid_mask = torch.tensor(
-                            [int(t.item()) in proto_to_idx for t in target],
-                            dtype=torch.bool, device=self.device
-                        )
-                        if valid_mask.any():
-                            valid_logits = gpa_logits[valid_mask]
-                            valid_targets = target[valid_mask]
-                            gpa_labels = torch.tensor(
-                                [proto_to_idx[int(t.item())] for t in valid_targets],
-                                dtype=torch.long, device=self.device
-                            )
-                            gpa_loss = F.cross_entropy(valid_logits, gpa_labels)
-                            loss = loss + self.lambda_gpa * gpa_loss
-                # ----------------------------------------------------
-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -683,38 +561,7 @@ class Client_DF:
             skip_start_hook: CP2 恢复时跳过 Phase2 开始钩子（快照已在恢复时注入）
         """
         self.model.train()  # usage 只在训练模式累积
-        # =============================================================
-        # E6a-v3a-Diag: No-Anchor-WD
-        # 诊断实验（默认关闭）: Phase2 中 anchor_pool 免 weight decay。
-        # No-Anchor-WD is used to test whether weight decay is the primary
-        # driver of old-anchor norm collapse during Phase2.
-        # （旧 Anchor 行并非只剩 WD 梯度——仍可能收到 temporal / diversity /
-        #   少量 route 等任务梯度；但 WD × Adam 自适应归一化是范数塌缩的
-        #   主驱动，已由 E6a-v3a 因果验证: norm_ratio 0.0102→1.0031）
-        # =============================================================
-        if self.anchor_no_wd and hasattr(self.model, 'anchor_pool'):
-            anchor_param = self.model.anchor_pool
-            other_params = [
-                p for p in self.model.parameters()
-                if p is not anchor_param
-            ]
-            optimizer = torch.optim.Adam(
-                [
-                    {
-                        'params': other_params,
-                        'weight_decay': 1e-3,
-                    },
-                    {
-                        'params': [anchor_param],
-                        'weight_decay': 0.0,
-                    },
-                ],
-                lr=self.lr,
-            )
-            print("[E6a-v3a-Diag] Phase2 optimizer: anchor_pool "
-                  "weight_decay=0 (No-Anchor-WD), other params wd=1e-3")
-        else:
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
         # =============================================================
@@ -777,63 +624,55 @@ class Client_DF:
             # 仅 Task Checkpoint（诊断关闭）: 只保存，不做评估
             self._task_ckpt_phase2_start(round, args, global_step, total_steps)
 
-        # =============================================================
-        # E6a-v3b B-实验: Phase2 最小因果干预（默认全部关闭 = B0 原样）
-        # 位于 phase2_start 钩子之后 → pre-P2 诊断基线在 Normal 协议下
-        # 采集；训练循环结束、返回之前恢复 → phase2_end 诊断（post-P2
-        # PhaseDiag / SoftMassDiag / 各 CF）同样在 Normal 协议下评估。
-        # =============================================================
-        # B1/B3: Seen-only retrieval —— Phase2 训练期 hard route 与
-        # soft attention 只允许 T0..T_cur 的 keys/anchors（屏蔽 future
-        # unseen keys 的候选竞争）。route loss / MSP 不受影响（它们直接
-        # 用 compute_similarity / 参数本身，不走 _get_routing_similarity）。
-        b1_backup = None
-        if self.p2_seen_only:
-            b1_backup = (
-                self.model.use_seen_routing,
-                self.model.seen_class_mask.detach().clone(),
-            )
-            seen_union = sorted(set().union(*[
-                set(int(c) for c in self.class_mask[k])
-                for k in range(0, self.task_id + 1)
-            ]))
-            b1_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
-            b1_mask[torch.tensor(seen_union, dtype=torch.long)] = True
-            self.model.use_seen_routing = True
-            self.model.seen_class_mask.copy_(
-                b1_mask.to(
-                    device=self.model.seen_class_mask.device,
-                    dtype=self.model.seen_class_mask.dtype
-                )
-            )
-            print(f"[E6a-v3b-B1] Phase2 Seen-only retrieval: "
-                  f"client={self.id} task={self.task_id} "
-                  f"allowed={len(seen_union)}/{self.nb_classes} classes")
-
-        # B2/B3: old-Key freeze —— 真正的冻结（不是仅梯度置零）:
-        # 每步 optimizer.step() 之后用 index_copy_ 恢复旧 Key 行快照，
-        # 连 weight decay / temporal / route loss 的任何更新一并消除。
-        b2_old_idx = None
-        b2_key_snapshot = None
-        if (self.p2_freeze_old_key
-                and self.task_id >= 1
-                and len(self.old_seen_classes) > 0):
-            b2_old_idx = torch.tensor(
-                sorted(self.old_seen_classes), dtype=torch.long,
-                device=self.model.key.device
-            )
-            b2_key_snapshot = (
-                self.model.key.data[b2_old_idx].detach().clone()
-            )
-            print(f"[E6a-v3b-B2] Phase2 old-Key freeze: "
-                  f"client={self.id} task={self.task_id} "
-                  f"n_old_keys={b2_old_idx.numel()} "
-                  f"(post-step index_copy_ restore)")
-
         # E6a-v2-Diag: 优化步数统计（StepDiag，默认关闭时零开销）
         diag_steps_active = self._tidr_diag_config is not None
         diag_num_batches = 0
         diag_num_samples = 0
+
+        # =============================================================
+        # E6a-v3b-Diag r6-fix: Phase2FutureRouteDiag
+        # 当前任务训练样本 hard-route 的分组去向统计 + future key
+        # 命中直方图。验证机制链:
+        #   Task_cur 训练样本 → hard-route 到 future key
+        #   → pull_off2 对 key_norm[hard_idx] 可微（该 future key 被更新）
+        #   → future attractor 形成 → 污染旧 query 的 top-1 routing
+        # 注意: E3 主线 soft retrieval 的残差整体 detach，CE 梯度只回传
+        # hard_anchor；future keys 的候选更新通路 = hard-key pull
+        # + key weight decay。
+        # 直方图存 self._diag_p2_future_key_hist，供 phase2_end 与
+        # T0 attractor top5 求交。
+        # =============================================================
+        self._diag_p2_future_key_hist = None
+        p2_fr_active = (
+            self._tidr_diag_config is not None
+            and self.task_id < len(self.class_mask) - 1
+        )
+        p2_future_idx = None
+        p2_current_idx = None
+        p2_old_idx = None
+        p2_route_total = 0
+        p2_to_future = 0
+        p2_to_current = 0
+        p2_to_old_seen = 0
+        p2_future_key_hist = None
+        if p2_fr_active:
+            seen_all_p2 = set()
+            for k in range(0, self.task_id + 1):
+                seen_all_p2.update(
+                    int(c) for c in self.class_mask[k])
+            current_cls_p2 = sorted(
+                int(c) for c in self.class_mask[self.task_id])
+            future_cls_p2 = sorted(
+                set(range(self.nb_classes)) - seen_all_p2)
+            old_cls_p2 = sorted(
+                seen_all_p2 - set(current_cls_p2))
+            p2_future_idx = torch.tensor(
+                future_cls_p2, dtype=torch.long, device=self.device)
+            p2_current_idx = torch.tensor(
+                current_cls_p2, dtype=torch.long, device=self.device)
+            p2_old_idx = torch.tensor(
+                old_cls_p2, dtype=torch.long, device=self.device)
+            p2_future_key_hist = torch.zeros(self.nb_classes)
 
         for epoch in tqdm(range(self.local_epoch)):
             for input, target in train_loader:
@@ -854,19 +693,29 @@ class Client_DF:
                                       cls_features=cls_features, train=True)
                     feat_prompt = output['feat']
 
-                # GPC-DR: build proto bank + calib mask
-                proto_bank, proto_valid = self._build_semantic_proto_bank()
-                proto_calib_mask = self._build_proto_calib_mask(self.task_id)
-
                 pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx, routing_logits = self.model(
                     feat_prompt.to(self.device), target.to(self.device),
-                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
-                    proto_calib_mask=proto_calib_mask
                 )
                 logits = pre
 
                 # E1-Repair v1: sample-weighted routing diagnostics
                 task_hard_usage += torch.bincount(hard_idx, minlength=self.nb_classes).float()
+
+                # E6a-v3b-Diag r6-fix: Phase2FutureRouteDiag 累积
+                # （当前任务训练样本 hard route 去向 + future key 直方图）
+                if p2_fr_active:
+                    hard_det_p2 = hard_idx.detach()
+                    p2_route_total += hard_det_p2.numel()
+                    to_fut_m = torch.isin(hard_det_p2, p2_future_idx)
+                    p2_to_future += to_fut_m.sum().item()
+                    p2_to_current += torch.isin(
+                        hard_det_p2, p2_current_idx).sum().item()
+                    p2_to_old_seen += torch.isin(
+                        hard_det_p2, p2_old_idx).sum().item()
+                    p2_future_key_hist += torch.bincount(
+                        hard_det_p2[to_fut_m],
+                        minlength=self.nb_classes
+                    ).cpu()
 
                 # E6a-v2-Diag: Task1 样本 hard route 到旧类 Anchor 的比例
                 # （判断旧 Anchor 漂移来自 Task1 CE 直接更新还是 MSP diversity 全局梯度）
@@ -929,13 +778,8 @@ class Client_DF:
                     - 0.1 * pull_off2
                 )
 
-                # ---- GPC-DR: PCR loss (no extra temperature) or legacy route loss ----
-                if self.use_proto_calibration:
-                    pcr_loss = self._compute_pcr_loss(
-                        routing_logits, target, self.seen_classes
-                    )
-                    loss = loss + self.lambda_pcr * pcr_loss
-                elif self.use_route_loss:
+                # ---- FedSMR-v2: 监督路由损失 L_route ----
+                if self.use_route_loss:
                     sim = self.model.compute_similarity(feat_prompt.to(self.device))
                     route_loss = self._compute_route_loss(
                         sim, target, self.seen_classes
@@ -947,23 +791,9 @@ class Client_DF:
                     msp_loss = self._compute_msp_losses(None, None, round)
                     loss = loss + msp_loss
 
-                # ---- FedSMR-v2: Prototype Head Replay ----
-                if self.use_proto_replay and self.global_protos is not None:
-                    proto_loss = self._compute_proto_replay_loss(self.global_protos)
-                    loss = loss + self.lambda_proto * proto_loss
-                # ----------------------------------------------------
-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-
-                # B2/B3: old-Key freeze（post-step 恢复快照，消除包括
-                # weight decay 在内的全部旧 Key 更新）
-                if b2_key_snapshot is not None:
-                    with torch.no_grad():
-                        self.model.key.data.index_copy_(
-                            0, b2_old_idx, b2_key_snapshot
-                        )
 
                 global_step += 1
 
@@ -977,6 +807,41 @@ class Client_DF:
                     diag_num_samples / diag_num_batches if diag_num_batches else 0.0
                 ),
             }
+
+        # =============================================================
+        # E6a-v3b-Diag r6-fix: Phase2FutureRouteDiag 输出
+        # cur_task_to_future_unseen_rate 明显 > 0 = 当前任务训练样本
+        # 确实 hard-route 到 future keys（pull_off2 更新通路成立的前提）。
+        # top5 命中 future key IDs 供与 post-P2 T0 attractor top5 求交。
+        # =============================================================
+        if p2_fr_active and p2_route_total > 0:
+            self._diag_p2_future_key_hist = p2_future_key_hist
+            n_fut_hit = int(
+                (p2_future_key_hist > 0).sum().item())
+            fr_parts = [
+                f"cur_task_to_future_unseen_rate="
+                f"{p2_to_future / p2_route_total:.4f}",
+                f"cur_task_to_current_task_rate="
+                f"{p2_to_current / p2_route_total:.4f}",
+                f"cur_task_to_old_seen_rate="
+                f"{p2_to_old_seen / p2_route_total:.4f}",
+                f"future_keys_hit_during_p2={n_fut_hit}",
+            ]
+            if n_fut_hit > 0:
+                top_cnt, top_id = p2_future_key_hist.topk(
+                    min(5, n_fut_hit))
+                ids_l = [int(i) for i in top_id.tolist()]
+                cnts_l = [int(c) for c in top_cnt.tolist()]
+                rates_l = [c / p2_route_total
+                           for c in top_cnt.tolist()]
+                fr_parts.append(
+                    f"top5_p2_future_key_ids={ids_l} "
+                    f"top5_p2_future_key_hit_counts={cnts_l} "
+                    f"top5_p2_future_key_hit_rates="
+                    f"{[f'{r:.4f}' for r in rates_l]}")
+            print(f"[TIDR-Phase2FutureRouteDiag] client={self.id} "
+                  f"task={self.task_id} "
+                  + ' '.join(fr_parts))
 
         # =============================================================
         # E1 routing diagnostics (sample-weighted summary)
@@ -999,25 +864,6 @@ class Client_DF:
             else:
                 print(f"[E1-Diag] client={self.id} task={self.task_id} "
                       f"entropy={entropy:.4f} max_w={max_weight:.4f}")
-
-        # =============================================================
-        # E6a-v3b B-实验: 干预状态恢复（phase2_end 诊断在 Normal 协议下运行）
-        # B1: 恢复 use_seen_routing / seen_class_mask 原值
-        # B2: 自检 —— 训练结束后旧 Key 行应与快照逐位一致
-        # =============================================================
-        if b1_backup is not None:
-            self.model.use_seen_routing = b1_backup[0]
-            self.model.seen_class_mask.copy_(b1_backup[1])
-            print(f"[E6a-v3b-B1] Seen-only retrieval disabled after "
-                  f"Phase2 (routing config restored)")
-
-        if b2_key_snapshot is not None:
-            with torch.no_grad():
-                b2_pass = torch.equal(
-                    self.model.key.data[b2_old_idx], b2_key_snapshot
-                )
-            print(f"[E6a-v3b-B2] old-Key freeze check: "
-                  f"old_key_bitwise_preserved={b2_pass}")
 
         return task_hard_usage
 
@@ -1099,13 +945,9 @@ class Client_DF:
                     output = output['pre_logits'].requires_grad_(False)
                 output = self.vit(input, task_id=self.task_id, cls_features=output,
                                   train=True)
-                proto_bank, proto_valid = self._build_semantic_proto_bank()
-                proto_calib_mask = self._build_proto_calib_mask(self.task_id)
 
                 _, output_mixed, _, _, _, _, _ = self.model(
                     output['feat'].to(self.device), target.to(self.device),
-                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
-                    proto_calib_mask=proto_calib_mask
                 )
 
             if not np.isnan(output_mixed.cpu().detach().numpy()).any():
@@ -1526,6 +1368,13 @@ class Client_DF:
                    for k in sorted(stats0_post.get('per_task_classes') or {})]
                 + (['soft_mass_to_future_unseen']
                    if stats0_post.get('future_unseen_classes') else [])
+                # v3b-Diag r6: per-key 归一化（消除 candidate-count
+                # effect，future ~76 keys vs 每任务 ~8 keys）
+                + ['mean_soft_mass_per_key_to_eval_task']
+                + [f'mean_soft_mass_per_key_to_task{k}'
+                   for k in sorted(stats0_post.get('per_task_classes') or {})]
+                + (['mean_soft_mass_per_key_to_future_unseen']
+                   if stats0_post.get('future_unseen_classes') else [])
                 + ['mean_soft_attn_entropy', 'mean_soft_attn_max_w']
                 # hard route 各组（与 soft 同表对照）
                 + ['to_eval_task_collision']
@@ -1540,10 +1389,14 @@ class Client_DF:
                 if v_post is None:
                     continue
                 # soft 字段的 pre 值需要 r5 累积器存在；hard 字段旧版已有
+                # v3b-Diag r6: 守卫扩展到 mean_soft_* 前缀（per-key /
+                # entropy / max_w），旧 extras 无累积器时不打印假 0 基线
                 can_print_pre = (
                     m_sm_pre is not None
                     and m_sm_pre.get(sm_key) is not None
-                    and (not sm_key.startswith('soft_') or has_pre_soft)
+                    and (not (sm_key.startswith('soft_')
+                              or sm_key.startswith('mean_soft_'))
+                         or has_pre_soft)
                 )
                 if can_print_pre:
                     sm_parts.append(
@@ -1557,6 +1410,90 @@ class Client_DF:
                 print(f"[TIDR-SoftMassDiag] client={self.id} "
                       f"task={self.task_id} eval_task=0 "
                       + ' '.join(sm_parts))
+
+            # ---- 1b2) FutureAttractorDiag: future key hard-route 直方图 ----
+            # 判断 T0 → future 66% hard collision 是"很多 future keys
+            # 普遍抢占"还是"少数 future keys 形成 routing sink/attractor"。
+            # pre 侧来自 _diag_phase_stats_pre（post-P1 基线；旧
+            # checkpoint extras 无 r6 直方图时只打印 post_p2）。
+            def _attractor_summary(hist, total_n):
+                if hist is None or total_n is None or total_n <= 0:
+                    return None
+                hits = float(hist.sum().item())
+                if hits <= 0:
+                    return {
+                        'unique': 0, 'ids': [], 'counts': [], 'rates': []
+                    }
+                nz_count = int((hist > 0).sum().item())
+                k_top = min(5, nz_count)
+                if k_top > 0:
+                    top_counts, top_ids = hist.topk(k_top)
+                    ids = [int(i) for i in top_ids.tolist()]
+                    counts = [int(c) for c in top_counts.tolist()]
+                    rates = [c / total_n
+                             for c in top_counts.tolist()]
+                else:
+                    ids, counts, rates = [], [], []
+                return {
+                    'unique': nz_count, 'ids': ids,
+                    'counts': counts, 'rates': rates
+                }
+
+            def _attractor_str(tag, s):
+                if s is None:
+                    return None
+                return (
+                    f"future_top1_unique_key_count_{tag}={s['unique']} "
+                    f"top5_future_attractor_key_ids_{tag}="
+                    f"{','.join(str(i) for i in s['ids']) or 'none'} "
+                    f"top5_future_attractor_counts_{tag}="
+                    f"{','.join(str(c) for c in s['counts']) or 'none'} "
+                    f"top5_future_attractor_rates_{tag}="
+                    f"{','.join(f'{r:.4f}' for r in s['rates']) or 'none'}"
+                )
+
+            attr_post = _attractor_summary(
+                stats0_post.get('future_hard_key_hist'),
+                stats0_post.get('total'))
+            attr_pre = _attractor_summary(
+                stats_pre.get('future_hard_key_hist')
+                if stats_pre else None,
+                stats_pre.get('total') if stats_pre else None)
+            attr_parts = []
+            if attr_pre is not None:
+                attr_parts.append(_attractor_str('post_p1', attr_pre))
+            if attr_post is not None:
+                attr_parts.append(_attractor_str('post_p2', attr_post))
+            # v3b-Diag r6-fix: 与 Phase2 训练期 future-key 命中集合求交
+            # —— 若 T0 的 top attractors 恰是 Task_cur 训练 hard-route
+            # 命中过的 future keys（pull_off2 更新通路），机制链闭合:
+            # Task_cur 训练样本 → 选中 future key → pull_off2 更新它
+            # → 它成为 T0 query 的 attractor
+            p2_fut_hist = getattr(
+                self, '_diag_p2_future_key_hist', None)
+            if (p2_fut_hist is not None
+                    and attr_post is not None
+                    and attr_post['ids']):
+                p2_hit_ids = set(
+                    int(i) for i in (
+                        p2_fut_hist > 0
+                    ).nonzero(as_tuple=False)
+                    .squeeze(-1).tolist()
+                )
+                overlap_ids = [
+                    i for i in attr_post['ids'] if i in p2_hit_ids
+                ]
+                attr_parts.append(
+                    f"p2_hit_future_key_count={len(p2_hit_ids)} "
+                    f"t0_attractors_among_p2_hits="
+                    f"{','.join(str(i) for i in overlap_ids) or 'none'} "
+                    f"t0_attractor_p2_hit_overlap="
+                    f"{len(overlap_ids)}/{len(attr_post['ids'])}"
+                )
+            if attr_parts:
+                print(f"[TIDR-FutureAttractorDiag] client={self.id} "
+                      f"task={self.task_id} eval_task=0 "
+                      + ' '.join(attr_parts))
 
         # ---- 2) StepDiag ----
         if self._diag_step_stats is not None:
@@ -1668,6 +1605,82 @@ class Client_DF:
         if len(prev_seen_classes) > 0:
             cf_parts = [f"acc_normal={acc_normal:.2f}"]
 
+            # ---- v3b-Diag r6: Identity RetrievalCF（全类允许 sanity）----
+            # allowed = 全部 nb_classes → 掩码为空操作，
+            # 必须与 normal 评估完全等价（acc / prediction / 中间张量
+            # 逐位一致）。任何一项不等 = RetrievalCF 评估路径仍有 bug，
+            # 四组 CF 结果一律不可信，不得开始 B1。
+            identity_mask = torch.ones(
+                self.nb_classes, dtype=torch.bool)
+
+            def _cap_cat(cap, key):
+                if not cap.get(key):
+                    return None
+                return torch.cat(cap[key], dim=0)
+
+            def _max_abs_diff(a, b):
+                if a is None or b is None or a.numel() != b.numel():
+                    return float('nan')
+                if a.numel() == 0:
+                    return 0.0
+                return (a - b).abs().max().item()
+
+            def _head_digest():
+                # 评估实际加载的 head 快照（heads[0]）的字节摘要，
+                # 检测评估路径是否篡改快照
+                sd = self.heads[0].state_dict()
+                buf = b''.join(
+                    v.detach().cpu().numpy().tobytes()
+                    for v in sd.values()
+                )
+                return hashlib.md5(buf).hexdigest()[:8]
+
+            cap_normal = {}
+            acc_norm_id, _ = self._diag_eval_task(
+                0, collect_stats=False, capture=cap_normal)
+            normal_head_digest = _head_digest()
+            cap_identity = {}
+            acc_identity, _ = self._diag_eval_task(
+                0, collect_stats=False,
+                retrieval_allowed_mask=identity_mask,
+                capture=cap_identity)
+            identity_head_digest = _head_digest()
+
+            pred_n = _cap_cat(cap_normal, 'predicts')
+            pred_i = _cap_cat(cap_identity, 'predicts')
+            if (pred_n is not None and pred_i is not None
+                    and pred_n.numel() == pred_i.numel()
+                    and pred_n.numel() > 0):
+                match_rate = (
+                    pred_n == pred_i).float().mean().item()
+            else:
+                match_rate = float('nan')
+            rl_diff = _max_abs_diff(
+                _cap_cat(cap_normal, 'routing_logits'),
+                _cap_cat(cap_identity, 'routing_logits'))
+            sa_diff = _max_abs_diff(
+                _cap_cat(cap_normal, 'attn_weights'),
+                _cap_cat(cap_identity, 'attn_weights'))
+            af_diff = _max_abs_diff(
+                _cap_cat(cap_normal, 'anchor_feat'),
+                _cap_cat(cap_identity, 'anchor_feat'))
+            cl_diff = _max_abs_diff(
+                _cap_cat(cap_normal, 'classifier_logits'),
+                _cap_cat(cap_identity, 'classifier_logits'))
+
+            print(f"[TIDR-RetrievalCF-Identity] client={self.id} "
+                  f"task={self.task_id} "
+                  f"acc_normal={acc_norm_id:.2f} "
+                  f"acc_identity={acc_identity:.2f} "
+                  f"prediction_match_rate={match_rate:.4f} "
+                  f"routing_logits_max_abs_diff={rl_diff:.6f} "
+                  f"soft_attention_max_abs_diff={sa_diff:.6f} "
+                  f"retrieved_anchor_max_abs_diff={af_diff:.6f} "
+                  f"classifier_logits_max_abs_diff={cl_diff:.6f} "
+                  f"normal_head_digest={normal_head_digest} "
+                  f"identity_head_digest={identity_head_digest} "
+                  f"normal_eval_task=0 identity_eval_task=0")
+
             # Seen-only: T0..T{task_id}（future unseen 存在时才有意义）
             seen_classes_cf = sorted(set().union(*[
                 set(int(c) for c in self.class_mask[k])
@@ -1773,6 +1786,92 @@ class Client_DF:
         print(f"[TIDR-KeyCF] client={self.id} task={self.task_id} "
               f"acc_normal={acc_normal:.2f} acc_rollback={acc_rollback:.2f} "
               f"recovery={recovery:+.2f} key_restoration_pass={restoration_pass}")
+
+        # ---- 4a2) FutureKeyDriftDiag: future-unseen keys 的 Phase2 漂移 ----
+        # Round10 异象: T0 → future hard collision 4.62% → 66.03%，
+        # 但 old-key rollback 只解释一部分，且 feature drift = 0
+        # → 疑点: future keys 在 Phase2 中自身漂移，把 routing geometry
+        # 拉向未训练区域。
+        # 漂移来源候选链（待 Phase2FutureRouteDiag / FutureKeyCF 验证，
+        # E3 主线 soft residual 整体 detach，CE 梯度只回传 hard_anchor;
+        # future keys 不走 soft 通路）:
+        #   all-key hard routing → 当前任务样本偶尔 hard-route 到
+        #   future key → pull_off2 对 key_norm[hard_idx] 可微 →
+        #   被选中的 future key 获得更新（+ key weight decay，
+        #   No-Anchor-WD 只豁免 anchor_pool 不豁免 key）
+        #   → future key 漂移成为旧 query 的 top-1 attractor
+        #   → 正反馈 routing 污染。
+        # 此处只度量漂移；因果反事实见 FutureKeyCF。
+        all_seen_cls = set()
+        for k in range(0, self.task_id + 1):
+            all_seen_cls.update(
+                int(c) for c in self.class_mask[k])
+        future_cls = sorted(
+            set(range(self.nb_classes)) - all_seen_cls)
+        if (self._diag_key_before_phase2 is not None
+                and len(future_cls) > 0):
+            kb_full = self._diag_key_before_phase2.to(self.device)
+            ka_full = self.model.key.detach()
+            fut_idx_k = torch.tensor(
+                future_cls, dtype=torch.long, device=self.device)
+            kb_f = kb_full.index_select(0, fut_idx_k)
+            ka_f = ka_full.index_select(0, fut_idx_k)
+            fk_cos = 1.0 - F.cosine_similarity(kb_f, ka_f, dim=1)
+            fk_sorted = fk_cos.sort().values
+            n_f = fk_sorted.numel()
+            fk_nr = ka_f.norm(dim=1) / kb_f.norm(dim=1).clamp_min(1e-8)
+            fk_l2 = (ka_f - kb_f).norm(dim=1)
+            fut_parts = [
+                f"mean_future_key_cos_drift={fk_cos.mean().item():.6f}",
+                f"median_future_key_cos_drift="
+                f"{fk_sorted[n_f // 2].item():.6f}",
+                f"p95_future_key_cos_drift="
+                f"{fk_sorted[min(n_f - 1, int(0.95 * n_f))].item():.6f}",
+                f"max_future_key_cos_drift={fk_cos.max().item():.6f}",
+                f"mean_future_key_l2_drift={fk_l2.mean().item():.6f}",
+                f"max_future_key_l2_drift={fk_l2.max().item():.6f}",
+                f"mean_future_key_norm_ratio={fk_nr.mean().item():.6f}",
+                f"max_abs_future_key_norm_change="
+                f"{(ka_f.norm(dim=1) - kb_f.norm(dim=1)).abs().max().item():.6f}",
+            ]
+            # 按 future task 分组（口径统一: 过滤掉已在已见任务中出现
+            # 的共享类，只统计真正的 future-unseen keys）
+            future_cls_set = set(future_cls)
+            for k in range(self.task_id + 1, len(self.class_mask)):
+                cls_k = [int(c) for c in self.class_mask[k]
+                         if int(c) in future_cls_set]
+                if not cls_k:
+                    continue
+                idx_k = torch.tensor(
+                    cls_k, dtype=torch.long, device=self.device)
+                cos_k = (
+                    1.0 - F.cosine_similarity(
+                        kb_full.index_select(0, idx_k),
+                        ka_full.index_select(0, idx_k), dim=1)
+                ).mean().item()
+                l2_k = (
+                    ka_full.index_select(0, idx_k)
+                    - kb_full.index_select(0, idx_k)
+                ).norm(dim=1).mean().item()
+                fut_parts.append(
+                    f"task{k}_mean_future_key_cos_drift={cos_k:.6f} "
+                    f"task{k}_mean_future_key_l2_drift={l2_k:.6f}")
+            print(f"[TIDR-FutureKeyDriftDiag] client={self.id} "
+                  f"task={self.task_id} "
+                  + ' '.join(fut_parts))
+
+            # ---- 4a3) FutureKeyCF: 只回滚 future-unseen keys ----
+            # 与 OldKeyCF 严格区分: 只恢复未来任务 keys 到 pre-P2，
+            # old keys / anchors / head / feature 全部保持 post-P2。
+            # 若 recovery 显著为正 → future key drift 本身是
+            # Task0 遗忘的直接因果因素（routing attractor 假说成立）。
+            acc_fkey, fkey_recovery, fkey_pass = (
+                self._diag_future_key_cf(acc_normal, future_cls))
+            print(f"[TIDR-FutureKeyCF] client={self.id} task={self.task_id} "
+                  f"acc_normal={acc_normal:.2f} "
+                  f"acc_future_key_rollback={acc_fkey:.2f} "
+                  f"recovery={fkey_recovery:+.2f} "
+                  f"future_key_restoration_pass={fkey_pass}")
 
         # ---- 4b) AnchorDrift: 旧 Anchor Phase2 前后漂移度量 ----
         # anchor_before 来源优先级: phase2_start 快照 > prev_anchor_pool
@@ -1994,6 +2093,116 @@ class Client_DF:
         # ============================================================
         # 严格检查恢复是否成功
         # ============================================================
+        restoration_pass = bool(
+            torch.equal(
+                self.model.key.detach(),
+                key_backup
+            )
+        )
+
+        recovery = (
+            acc_rollback - acc_normal
+            if not np.isnan(acc_rollback)
+            else float('nan')
+        )
+
+        return (
+            acc_rollback,
+            recovery,
+            restoration_pass
+        )
+
+    def _diag_future_key_cf(self, acc_normal, future_classes):
+        """
+        E6a-v3b-Diag r6: Future-Key Rollback 反事实实验。
+
+        与 _diag_key_rollback（OldKeyCF）严格区分:
+        - OldKeyCF: 恢复过去任务 keys（old_seen_classes）
+        - FutureKeyCF: 只恢复 future-unseen keys（尚未训练的任务）
+
+        控制变量:
+        - old keys 不回滚
+        - anchors 不回滚
+        - head 不回滚
+        - feature 不变
+        - 只把 future-unseen key 行恢复为 pre-P2 checkpoint 状态
+
+        结束后无条件恢复完整 Phase2 后 Key。
+        """
+        if (
+            self._diag_key_before_phase2 is None
+            or future_classes is None
+            or len(future_classes) == 0
+        ):
+            return float('nan'), float('nan'), False
+
+        fut_idx = torch.tensor(
+            sorted(int(c) for c in future_classes),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        # Phase2 后完整 Key 备份
+        key_backup = (
+            self.model.key
+            .detach()
+            .clone()
+        )
+
+        acc_rollback = float('nan')
+
+        try:
+            # ========================================================
+            # 仅恢复 future-unseen Key 行（setitem 写回 Parameter）
+            # ========================================================
+            with torch.no_grad():
+                key_before = (
+                    self._diag_key_before_phase2
+                    .to(
+                        device=self.device,
+                        dtype=self.model.key.dtype
+                    )
+                )
+
+                self.model.key[fut_idx] = (
+                    key_before[fut_idx]
+                )
+
+                # 写回验证
+                assert torch.equal(
+                    self.model.key.data[fut_idx],
+                    key_before[fut_idx]
+                ), "[TIDR-FutureKeyCF] rollback write-back failed"
+
+            # ========================================================
+            # Rollback 后重新评估 Task0（collect_stats=True →
+            # [TIDR-Diag-FutureKeyCF] 重打印 to_future_unseen_collision /
+            # mean_vs_future_unseen_margin / soft_mass_to_future_unseen 等）
+            # ========================================================
+            acc_rollback, stats_fkey = (
+                self._diag_eval_task(
+                    0,
+                    collect_stats=True
+                )
+            )
+
+            if stats_fkey:
+                self._print_diag_stats(
+                    'TIDR-Diag-FutureKeyCF',
+                    self.id,
+                    0,
+                    self._format_diag_stats(stats_fkey)
+                )
+
+        finally:
+            # ========================================================
+            # 无论诊断是否成功，恢复完整 Phase2 后 Key
+            # ========================================================
+            with torch.no_grad():
+                self.model.key.copy_(
+                    key_backup
+                )
+
         restoration_pass = bool(
             torch.equal(
                 self.model.key.detach(),
@@ -2262,7 +2471,7 @@ class Client_DF:
         )
 
     def _diag_eval_task(self, task, collect_stats=False,
-                        retrieval_allowed_mask=None):
+                        retrieval_allowed_mask=None, capture=None):
         """
         E6a-v2-Diag: 只读、可恢复的确定性单任务评估。
 
@@ -2277,6 +2486,12 @@ class Client_DF:
         传入 bool [nb_classes] 掩码时，临时开启 use_seen_routing 并替换
         seen_class_mask，使 hard/soft 检索只允许掩码内的 keys/anchors
         （softmax 自然重归一化）。finally 中完整恢复原状态。
+
+        E6a-v3b-Diag r6: capture（Identity RetrievalCF 专用）
+        传入 dict 时按 batch 捕获 predicts / routing_logits / attn_weights /
+        anchor_feat / classifier_logits（task-mask 之前的原始 head logits），
+        用于 normal vs identity 的逐位对照。固定诊断 seed 保证两次评估
+        看到相同增强实例。
 
         Returns:
             (acc, stats); stats 仅在 collect_stats 且 task < self.task_id 时填充
@@ -2384,6 +2599,18 @@ class Client_DF:
                     'soft_allowed_mass_sum': 0.0,
                 }
                 allowed_idx_dev = allowed_idx.to(self.device)
+                # ---- v3b-Diag r6: nan/inf 链路计数器 ----
+                # 目标全部 = 0。任何一个非 0 都说明掩码评估路径仍在
+                # 产生 NaN（如 -inf 参与减法/softmax），对应 CF 结果
+                # 一律不可信。
+                mask_verify.update({
+                    'nan_routing_logits_count': 0.0,
+                    'nan_attn_logits_count': 0.0,
+                    'nan_soft_attention_count': 0.0,
+                    'nan_anchor_feat_count': 0.0,
+                    'nan_classifier_logits_count': 0.0,
+                    'all_inf_attn_row_count': 0.0,
+                })
 
             # --------------------------------------------------------
             # 临时加载被评估任务对应的 head
@@ -2403,15 +2630,6 @@ class Client_DF:
                 test_data,
                 batch_size=8,
                 shuffle=False
-            )
-
-            # GPC/TIDR 所需状态
-            proto_bank, proto_valid = (
-                self._build_semantic_proto_bank()
-            )
-
-            proto_calib_mask = (
-                self._build_proto_calib_mask(task)
             )
 
             do_stats = (
@@ -2481,16 +2699,13 @@ class Client_DF:
                         pre,
                         _,
                         _,
-                        _,
+                        anchor_feat,
                         attn_weights,
                         hard_idx,
                         routing_logits
                     ) = self.model(
                         feat,
                         target,
-                        proto_bank=proto_bank,
-                        proto_valid_mask=proto_valid,
-                        proto_calib_mask=proto_calib_mask
                     )
 
                     logits = pre
@@ -2529,6 +2744,28 @@ class Client_DF:
                     total += len(target)
 
                     # -----------------------------------------------
+                    # v3b-Diag r6: Identity RetrievalCF 张量捕获
+                    # （classifier_logits 用 task-mask 之前的原始 pre，
+                    #   避免与 -inf 填充混淆）
+                    # -----------------------------------------------
+                    if capture is not None:
+                        capture.setdefault(
+                            'predicts', []
+                        ).append(predicts.detach().cpu())
+                        capture.setdefault(
+                            'routing_logits', []
+                        ).append(routing_logits.detach().float().cpu())
+                        capture.setdefault(
+                            'attn_weights', []
+                        ).append(attn_weights.detach().float().cpu())
+                        capture.setdefault(
+                            'anchor_feat', []
+                        ).append(anchor_feat.detach().float().cpu())
+                        capture.setdefault(
+                            'classifier_logits', []
+                        ).append(pre.detach().float().cpu())
+
+                    # -----------------------------------------------
                     # TIDR routing diagnostics
                     # -----------------------------------------------
                     if do_stats:
@@ -2548,6 +2785,7 @@ class Client_DF:
 
                     # -----------------------------------------------
                     # v3b-Diag r5: RetrievalCF sanity check 累积
+                    # v3b-Diag r6: nan/inf 链路计数
                     # -----------------------------------------------
                     if mask_verify is not None:
                         mask_verify['n'] += len(target)
@@ -2561,6 +2799,31 @@ class Client_DF:
                         mask_verify['soft_allowed_mass_sum'] += (
                             attn_weights[:, allowed_idx_dev]
                             .sum().item()
+                        )
+                        # nan 计数: routing_logits / soft attention /
+                        # anchor_feat / classifier_logits 均为 forward
+                        # 真实返回值；E3 主线中 attn_logits 前向恒等于
+                        # routing_logits（无 TIDR 列掩码），故直接对
+                        # routing_logits 计数，日志字段保持不变。
+                        finite_rl = torch.isfinite(routing_logits)
+                        mask_verify['nan_routing_logits_count'] += (
+                            torch.isnan(routing_logits).sum().item()
+                        )
+                        mask_verify['nan_attn_logits_count'] += (
+                            torch.isnan(routing_logits).sum().item()
+                        )
+                        mask_verify['nan_soft_attention_count'] += (
+                            torch.isnan(attn_weights).sum().item()
+                        )
+                        mask_verify['nan_anchor_feat_count'] += (
+                            torch.isnan(anchor_feat).sum().item()
+                        )
+                        mask_verify['nan_classifier_logits_count'] += (
+                            torch.isnan(pre).sum().item()
+                        )
+                        # 整行全 -inf（softmax 会产生 nan 的退化行）
+                        mask_verify['all_inf_attn_row_count'] += (
+                            (~finite_rl).all(dim=1).sum().item()
                         )
 
             acc = (
@@ -2580,7 +2843,19 @@ class Client_DF:
                       f"mean_finite_routing_logits="
                       f"{mask_verify['finite_logits_sum'] / n_v:.4f} "
                       f"soft_attention_allowed_mass="
-                      f"{mask_verify['soft_allowed_mass_sum'] / n_v:.4f}")
+                      f"{mask_verify['soft_allowed_mass_sum'] / n_v:.4f} "
+                      f"nan_routing_logits_count="
+                      f"{mask_verify['nan_routing_logits_count']:.0f} "
+                      f"nan_attn_logits_count="
+                      f"{mask_verify['nan_attn_logits_count']:.0f} "
+                      f"nan_soft_attention_count="
+                      f"{mask_verify['nan_soft_attention_count']:.0f} "
+                      f"nan_anchor_feat_count="
+                      f"{mask_verify['nan_anchor_feat_count']:.0f} "
+                      f"nan_classifier_logits_count="
+                      f"{mask_verify['nan_classifier_logits_count']:.0f} "
+                      f"all_inf_attn_row_count="
+                      f"{mask_verify['all_inf_attn_row_count']:.0f}")
 
             return acc, stats
 
@@ -2675,6 +2950,10 @@ class Client_DF:
             'future_collision': 0.0,
             'future_margin_sum': 0.0,
             'future_margin_negative': 0.0,
+            # v3b-Diag r6: future attractor —— 落到 future keys 上的
+            # hard route 直方图（判断 future collision 是普遍抢占还是
+            # 少数 key 形成 routing sink）
+            'future_hard_key_hist': torch.zeros(self.nb_classes),
             'all_non_eval_classes': all_non_eval_classes,
             'all_collision': 0.0,
             'all_margin_sum': 0.0,
@@ -2802,6 +3081,13 @@ class Client_DF:
             stats['future_margin_negative'] += (
                 fut_margin < 0
             ).float().sum().item()
+            # v3b-Diag r6: future attractor 直方图（键存在性检查:
+            # 旧 checkpoint extras 恢复的 stats 无此累积器时跳过）
+            if 'future_hard_key_hist' in stats:
+                fut_hits = hard_idx[torch.isin(hard_idx, fut_idx)]
+                stats['future_hard_key_hist'] += torch.bincount(
+                    fut_hits, minlength=self.nb_classes
+                ).cpu()
 
         if stats.get('all_non_eval_classes'):
             all_idx = torch.tensor(
@@ -2976,6 +3262,29 @@ class Client_DF:
             soft_items.append((
                 'soft_mass_to_future_unseen',
                 stats.get('soft_mass_future_sum', 0.0) / total))
+        # v3b-Diag r6: per-key 归一化（aggregate mass / 该组候选数）。
+        # future-unseen 约 76 个候选 vs 每任务约 8 个，aggregate
+        # soft mass 有明显 candidate-count effect；per-key 口径 =
+        # "单个 key 平均拿到的注意力份额"，跨组才可比较
+        n_eval_cls = len(stats.get('eval_classes') or [])
+        if n_eval_cls > 0:
+            soft_items.append((
+                'mean_soft_mass_per_key_to_eval_task',
+                stats.get('soft_mass_eval_sum', 0.0)
+                / total / n_eval_cls))
+        for k in sorted(stats.get('soft_mass_per_task_sum') or {}):
+            cls_k = (stats.get('per_task_classes') or {}).get(k)
+            if cls_k:
+                soft_items.append((
+                    f'mean_soft_mass_per_key_to_task{k}',
+                    stats['soft_mass_per_task_sum'][k]
+                    / total / len(cls_k)))
+        if stats.get('future_unseen_classes'):
+            n_fut_cls = len(stats['future_unseen_classes'])
+            soft_items.append((
+                'mean_soft_mass_per_key_to_future_unseen',
+                stats.get('soft_mass_future_sum', 0.0)
+                / total / n_fut_cls))
         soft_items.append((
             'mean_soft_attn_entropy',
             stats.get('soft_entropy_sum', 0.0) / total))
@@ -3207,9 +3516,6 @@ class Client_DF:
             # eval 模式: usage 不累积
             self.model.eval()
 
-            proto_bank, proto_valid = self._build_semantic_proto_bank()
-            proto_calib_mask = self._build_proto_calib_mask(0)
-
             feats = []
 
             with torch.no_grad():
@@ -3237,9 +3543,6 @@ class Client_DF:
                     _, _, _, anchor_feat, _, _, _ = self.model(
                         feat,
                         target,
-                        proto_bank=proto_bank,
-                        proto_valid_mask=proto_valid,
-                        proto_calib_mask=proto_calib_mask
                     )
                     feats.append(anchor_feat.detach().cpu())
 
@@ -3321,7 +3624,19 @@ class Client_DF:
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
-        if self.task_id == 0:
+        # ---- CL 评估协议 ----
+        # Task 最后一轮: 评估所有 seen tasks（T0..T_cur），构建标准
+        # continual-learning accuracy matrix R[i][j]（i=训练到第几个
+        # task，j=被评估 task）。其余轮次保持原行为（Task0 + 当前
+        # task），避免每轮 5x 评估开销。
+        # matrix row 由 Server 在分发完成后统一收集写入 cl_matrix CSV。
+        if (round_num + 1) % self.task_per_global_epoch == 0:
+            accs = []
+            for t in range(0, self.task_id + 1):
+                accs.append(self.evaluate(
+                    t, self.nb_classes, phase="TaskEnd AllSeen"))
+            self.cl_matrix_row = [self.task_id, accs]
+        elif self.task_id == 0:
             self.evaluate(self.task_id, self.nb_classes)
         else:
             self.evaluate(0, self.nb_classes)
@@ -3512,10 +3827,6 @@ class Client_DF:
                 dtype=torch.long, device=self.device
             )
 
-        # GPC-DR: proto bank for calibrated evaluation
-        proto_bank, proto_valid = self._build_semantic_proto_bank()
-        proto_calib_mask = self._build_proto_calib_mask(task)
-
         for input, target in test_loader:
             input = input.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
@@ -3530,8 +3841,6 @@ class Client_DF:
                 # 正常 E1 soft inference (TIDR-Diag: 接出 hard_idx)
                 pre, _, _, _, _, hard_idx, _ = self.model(
                     feat, target.to(self.device),
-                    proto_bank=proto_bank, proto_valid_mask=proto_valid,
-                    proto_calib_mask=proto_calib_mask
                 )
 
                 # Paired hard inference (同一 batch, 同一 ViT feature, 同一 head)
@@ -3541,8 +3850,6 @@ class Client_DF:
                         self.model.soft_anchor = False
                         pre_hard, _, _, _, _, _, _ = self.model(
                                 feat, target.to(self.device),
-                                proto_bank=proto_bank, proto_valid_mask=proto_valid,
-                                proto_calib_mask=proto_calib_mask
                             )
                     finally:
                         self.model.soft_anchor = original_flag
@@ -3741,6 +4048,7 @@ class Client_DF:
                   f"negative_margin_rate={neg_rate:.4f}")
 
         self._log_accuracy(acc.item(), f"{notes_prefix} {task}", phase, task_id=task)
+        return acc.item()
 
     def evaluate_cosin_similarity(self, task=0, nb_classes=None):
         """使用全局原型的余弦相似度进行评估"""

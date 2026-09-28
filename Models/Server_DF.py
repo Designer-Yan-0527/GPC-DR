@@ -120,6 +120,18 @@ class Server_DF(object):
         # 统一日志文件初始化
         self.log_file = self._init_log_file()
 
+        # CL 评估协议: continual-learning accuracy matrix R[i][j]
+        # （i=训练到第几个 task 后，j=被评估 task；task 末轮评估所有
+        #   seen tasks，用于计算标准 ACC / Forgetting F / BWT）
+        self.cl_matrix_file = self.log_file.replace('.csv', '_cl_matrix.csv')
+        self.cl_matrix = {}  # {client_id: [ [acc_t0, ...], ... ]} 按 after_task 索引
+        with open(self.cl_matrix_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ['after_task', 'client_id']
+                + [f'task{t}' for t in range(self.task_num)])
+        print(f"CL matrix 日志文件已创建: {self.cl_matrix_file}")
+
     def _build_log_filename(self):
         """
         FedSMR-v2 日志命名规则:
@@ -151,16 +163,6 @@ class Server_DF(object):
         # 可选增强后缀
         if getattr(self.args, 'use_route_loss', False):
             parts.append('Route')
-        if getattr(self.args, 'use_proto_replay', False):
-            parts.append('Proto')
-        if getattr(self.args, 'use_seen_routing', False):
-            parts.append('SeenRoute')
-        if getattr(self.args, 'use_diff_retrieval', False):
-            parts.append('Diff')
-        if getattr(self.args, 'use_proto_calibration', False):
-            parts.append('GPC')
-        if getattr(self.args, 'use_gpa', False):
-            parts.append('GPA')
 
         parts.append(dataset)
         return '_'.join(parts) + '.csv'
@@ -385,6 +387,11 @@ class Server_DF(object):
                         self.global_protos, self.global_head, self.prompt, i
                     )
 
+            # ---- CL 评估协议: Task 最后一轮分发完成后收集 matrix 行 ----
+            # （get_global_proto_and_head 内已完成全 seen tasks 评估）
+            if (i + 1) % self.global_epoch == 0:
+                self._collect_cl_matrix_rows(cur_task)
+
             # ---- E6a-v2-Diag: CP1（CF 轮前一轮全部完成后：训练+聚合+融合+分发） ----
             # E6a-v3b-Diag: 轮次/文件名跟随 diag_cf_round（默认 5 → R4_complete.pth；
             # Task2 传 10 → R9_complete.pth；resume_point 标签保持 'R4_complete'）
@@ -401,6 +408,89 @@ class Server_DF(object):
                                 f'Task{cur_task}_complete.pth', i)
 
         print("All Process completes")
+
+        # ---- CL 评估协议: 训练结束打印 ACC / F / BWT ----
+        self._print_cl_metrics()
+
+    def _collect_cl_matrix_rows(self, cur_task):
+        """
+        CL 评估协议: 收集各 client 在 Task 末轮生成的 matrix 行
+
+        - 追加写入 cl_matrix CSV（每行: after_task, client_id, task0..task{N-1}，
+          未评估的 task 留空）
+        - 存入 self.cl_matrix[client_id]（按 after_task 顺序），供训练结束
+          计算 ACC / Forgetting F / BWT
+        - 打印 [CL-Matrix] 摘要行
+        """
+        for client in self.clients:
+            if client.cl_matrix_row is None:
+                continue
+            task_id, accs = client.cl_matrix_row
+            with open(self.cl_matrix_file, 'a', newline='',
+                      encoding='utf-8') as f:
+                writer = csv.writer(f)
+                row = [f'after_task{task_id}', client.id]
+                row += [f'{a:.4f}' for a in accs]
+                row += [''] * (self.task_num - len(accs))
+                writer.writerow(row)
+            self.cl_matrix.setdefault(client.id, []).append(accs)
+            acc_str = ' '.join(
+                f'task{t}={a:.2f}' for t, a in enumerate(accs))
+            print(f"[CL-Matrix] after_task={task_id} client={client.id} "
+                  f"{acc_str}")
+            client.cl_matrix_row = None
+
+    def _print_cl_metrics(self):
+        """
+        CL 评估协议: 从 accuracy matrix R[i][j] 计算标准 CL 指标
+
+        - ACC = (1/N) * sum_j R[N-1][j]
+        - F_j = max_i R[i][j] - R[N-1][j]（对 j<N-1），F = mean_j F_j
+        - BWT = (1/(N-1)) * sum_{j<N-1} (R[N-1][j] - R[j][j])
+        """
+        if not self.cl_matrix:
+            print("[CL-Metrics] 无 matrix 数据（未收集到 Task 末轮评估）")
+            return
+
+        print("\n===== CL Metrics (Accuracy Matrix) =====")
+        all_acc, all_f, all_bwt = [], [], []
+        for client in self.clients:
+            rows = self.cl_matrix.get(client.id)
+            if not rows:
+                continue
+            n = len(rows)                      # 已完成的 after_task 数
+            last = rows[-1]                    # R[N-1][:]
+            num_tasks = len(last)
+
+            # ACC: 最终一行（学完所有任务后）对所有 seen tasks 的均值
+            acc = float(np.mean(last))
+
+            # Forgetting / BWT: 只在 matrix 完整（每 task 一行）时计算，
+            # 恢复运行产生的部分 matrix 跳过，避免越界/偏差
+            if n == num_tasks:
+                forgets = [
+                    max(rows[i][j] for i in range(n)) - last[j]
+                    for j in range(num_tasks - 1)
+                ]
+                f_mean = float(np.mean(forgets))
+                bwt = float(np.mean(
+                    [last[j] - rows[j][j] for j in range(num_tasks - 1)]))
+            else:
+                f_mean = float('nan')
+                bwt = float('nan')
+
+            print(f"[CL-Metrics] client={client.id} ACC={acc:.2f} "
+                  f"F={f_mean:.2f} BWT={bwt:.2f}")
+            all_acc.append(acc)
+            if not (f_mean != f_mean):  # nan 检查
+                all_f.append(f_mean)
+                all_bwt.append(bwt)
+
+        if all_acc:
+            msg = (f"[CL-Metrics] MEAN ACC={np.mean(all_acc):.2f}")
+            if all_f:
+                msg += (f" F={np.mean(all_f):.2f} BWT={np.mean(all_bwt):.2f}")
+            print(msg)
 
     def fuse_protos(self):
         """

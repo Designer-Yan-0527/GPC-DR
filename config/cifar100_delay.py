@@ -132,8 +132,6 @@ def get_args_parser(subparsers):
                             help='Soft Anchor softmax 温度')
     subparsers.add_argument('--soft_anchor_ratio', default=0.25, type=float,
                             help='残差系数 γ')
-    subparsers.add_argument('--use_seen_routing', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否将 Anchor 路由限制在 seen classes（避免未来类污染）')
 
     # -- Anchor Routing Loss --
     subparsers.add_argument('--use_route_loss', default=False, type=lambda x: (str(x).lower() == 'true'),
@@ -154,47 +152,6 @@ def get_args_parser(subparsers):
                             help='Key+Anchor Temporal Stability 系数')
     subparsers.add_argument('--key_temporal_ratio', default=0.5, type=float,
                             help='Key temporal 在总 temporal loss 中的权重 η')
-
-    # -- Prototype Head Replay --
-    subparsers.add_argument('--use_proto_replay', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Global Prototype Head Replay')
-    subparsers.add_argument('--lambda_proto', default=0.2, type=float,
-                            help='Proto replay 损失权重，CIFAR-100:0.20, ImageNet-R:0.30')
-
-    # -- Class-Aware Head Aggregation / Head Grad Mask --
-    # [已删除] use_class_aware_head_agg 和 use_head_grad_mask
-    # 原始 FedTA 设计：vit.head 做全局 FedAvg，Tail Anchor model.head 做 per-task 快照
-
-    # ===== GPC-DR: Global Prototype-Calibrated Differentiable Retrieval =====
-    subparsers.add_argument('--use_proto_calibration', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用全局原型校准路由 (GPC-DR)')
-    subparsers.add_argument('--proto_beta', default=0.5, type=float,
-                            help='原型路由权重 β')
-    subparsers.add_argument('--proto_temperature', default=0.10, type=float,
-                            help='原型相似度温度 τ_P')
-    subparsers.add_argument('--use_diff_retrieval', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Gradient-Decoupled Differentiable Retrieval')
-    subparsers.add_argument('--use_task_isolated_diff', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='TIDR: only current-task keys receive CE gradient through differentiable retrieval')
-    subparsers.add_argument('--anchor_no_wd', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='E6a-v3a-Diag: Phase2 optimizer 中 anchor_pool 免 weight decay（诊断旧 Anchor 范数坍缩是否由 weight decay 驱动）')
-    # ===== E6a-v3b B-实验: Phase2 最小因果干预（默认全部关闭 = B0 原样） =====
-    subparsers.add_argument('--p2_seen_only', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='B1/B3: Phase2 训练期 Seen-only retrieval（hard/soft 检索候选空间'
-                                 '限制为 T0..T_cur，屏蔽 future unseen keys 竞争；诊断钩子仍在 Normal 协议下评估）')
-    subparsers.add_argument('--p2_freeze_old_key', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='B2/B3: Phase2 训练期 old-Key freeze（每步 optimizer.step() 后用 '
-                                 'index_copy_ 恢复旧 Key 行快照，连 weight decay 一并消除）')
-    subparsers.add_argument('--adaptive_gamma', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用置信度门控的自适应 γ')
-    subparsers.add_argument('--gamma_max', default=0.35, type=float,
-                            help='自适应 γ 最大值')
-    subparsers.add_argument('--use_gpa', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Phase 1 Global Prototype Alignment')
-    subparsers.add_argument('--lambda_gpa', default=0.2, type=float,
-                            help='GPA 损失权重')
-    subparsers.add_argument('--lambda_pcr', default=0.05, type=float,
-                            help='PCR 损失权重 (proto calibration 启用时替代 lambda_route)')
 
     # ===== E6a-v2-Diag: Checkpoint 断点恢复 + 跨任务遗忘诊断（默认全部关闭） =====
     subparsers.add_argument('--save_checkpoints', action='store_true',

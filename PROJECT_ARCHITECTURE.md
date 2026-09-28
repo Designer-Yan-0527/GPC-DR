@@ -199,8 +199,6 @@ L_total = L_CE
 | E2 | Residual Soft | ✓ | | + Route Loss |
 | E3 (FedSMR) | Residual Soft | ✓ | ✓ | + MSP (完整 FedSMR) |
 
-扩展 ablation (E4, E5) 见 RUN_COMMANDS.md。
-
 **预期关键差值**:
 - E1−E0: Soft-Anchor 带来的梯度平滑收益
 - E2−E1: 路由损失消除 Soft-Anchor routing ambiguity
