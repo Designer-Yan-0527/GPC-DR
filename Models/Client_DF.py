@@ -22,6 +22,7 @@ FedSMR 框架客户端模块
 
 import csv
 import os
+import random
 from copy import deepcopy
 from datetime import datetime
 
@@ -39,14 +40,16 @@ from utils import CosineSimilarityClassifier
 from checkpoint_utils import (
     save_checkpoint,
     DiagStopException,
-    TIDR_DIAG_ROUND,
-    TIDR_DIAG_CLIENT,
-    TIDR_DIAG_TASK,
-    CKPT_CP2,
-    CKPT_CP3,
     get_rng_state,
     set_rng_state,
 )
+
+# E6a-v3b-Diag r3: 诊断评估固定 seed 基准（_diag_eval_task 用
+# TIDR_DIAG_EVAL_SEED + task 设置 torch/numpy/python/CUDA RNG，
+# 保证同一 task 的多次诊断评估——post_task_switch_pre_phase1 /
+# post_phase1 / post_phase2 / 各 CF——看到完全相同的增强实例；
+# 评估结束后由 finally 中的 set_rng_state 恢复真实训练 RNG）
+TIDR_DIAG_EVAL_SEED = 20260928
 
 
 class Client_DF:
@@ -123,6 +126,7 @@ class Client_DF:
         self.use_diff_retrieval = getattr(args, 'use_diff_retrieval', False)
         self.use_task_isolated_diff = getattr(args, 'use_task_isolated_diff', False)
         self.use_gpa = getattr(args, 'use_gpa', False)
+        self.anchor_no_wd = getattr(args, 'anchor_no_wd', False)
         self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
         self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
         # -------------------------------------------------------------------
@@ -170,8 +174,10 @@ class Client_DF:
         self.save_checkpoints = getattr(args, 'save_checkpoints', False)
         self._tidr_diag_config = None      # 由 Server_DF 在诊断轮注入
         self._resume_phase2_ctx = None     # CP2 恢复: 直接进入 Phase2
+        self._task_ckpt_config = None      # E6a-v3b-Diag: Task 边界 Checkpoint（Server 注入）
         self._diag_key_before_phase2 = None
         self._diag_key_after_phase2 = None
+        self._diag_anchor_before_phase2 = None
         self._diag_old_key_mask = None
         self._diag_feature_before = None
         self._diag_feature_after = None
@@ -179,6 +185,25 @@ class Client_DF:
         self._diag_phase_acc_pre = {}
         self._diag_phase_stats_pre = None
         self._diag_step_stats = None
+        self._diag_task1_old_route_hits = 0
+        self._diag_task1_old_route_total = 0
+        # ---- E6a-v3b-Diag: Phase1 窗口快照（pre_phase1 点） ----
+        self._diag_phase_acc_pre_p1 = {}          # {task k: acc_pre_phase1}
+        self._diag_key_pre_p1 = None              # key 快照（Phase1 前）
+        self._diag_anchor_pre_p1 = None           # anchor_pool 快照（Phase1 前）
+        self._diag_head_pre_p1 = None             # model.head state_dict 快照
+        self._diag_heads_pre_p1 = None            # heads[t<=task_id] state_dict 快照
+        self._diag_feature_pre_p1 = None          # Task0 样本特征快照（Phase1 前）
+        self._diag_anchor_feat_pre_p1 = None      # Task0 样本 retrieved anchor_feat 快照
+        self._diag_anchor_feat_before_phase2 = None  # post-P1 点 retrieved anchor_feat
+        # ---- E6a-v3b-Diag: 固定实际输入张量（消除随机增强噪声） ----
+        # 只固定 indices 时，若 dataset 带随机 crop/flip，pre/post 提取的
+        # 输入张量不同，drift 会混入 augmentation noise。
+        # 因此 pre_phase1 时缓存这批样本的 input/target 张量本身，
+        # 之后所有 drift / anchor_feat 提取复用完全相同的张量。
+        self._diag_fixed_inputs = None           # [N, C, H, W] CPU
+        self._diag_fixed_targets = None          # [N] CPU
+        self._diag_anchor_feat_after_phase2 = None  # post-P2 点 retrieved anchor_feat
 
     def _init_local_model(self, model_name):
         """
@@ -465,6 +490,40 @@ class Client_DF:
             )
             print(f'Client {self.id} on Task {self.task_id} is training '
                   f'(FedSMR, resumed at Phase2)')
+
+            # ---- v3b-Diag r3: legacy CP2 兼容（pre-P2 baseline 重建） ----
+            # 旧 R5_C0_pre_phase2.pth 只有 feature_sample_indices 和旧
+            # feature_before（旧运行当时那次增强实例 A 的像素），没有
+            # fixed tensors。若不重建，Phase2 后诊断时补建的 fixed
+            # tensors 是恢复运行重新增强的实例 B，pre(A)/post(B) 不逐位
+            # 相同，P2 FeatureDrift / RetrievedAnchorDrift 会混入 A→B
+            # 图像差异。此处（Phase2 第一个 batch 之前，模型仍为真正的
+            # pre-Phase2 状态）立即重建 fixed tensors 并在同一模型状态上
+            # 重算 pre-P2 baseline，保证 pre/post 严格可比。
+            # 注意: 旧 CP2 未保存 pre-Phase1 fixed snapshots，Round5 的
+            # P1Drift 无法凭空恢复（不影响 Round10 Task2 诊断）。
+            if (self._diag_feature_samples is not None
+                    and (self._diag_fixed_inputs is None
+                         or self._diag_fixed_targets is None)):
+                self._ensure_diag_fixed_inputs()
+                self._diag_feature_before = self._diag_extract_features()
+                self._diag_anchor_feat_before_phase2 = (
+                    self._diag_extract_anchor_feat()
+                )
+                # v3b-Diag r4: 同协议重建 pre-P2 accuracy/stats baseline。
+                # 旧 CP2 extras 里的 phase_acc_pre 是旧评估协议（无固定
+                # seed）算的，若不重建，resumed Round5 的 P2 acc change
+                # 是"旧协议 pre - 新 fixed-seed 协议 post"的混合口径。
+                self._diag_phase_acc_pre = {}
+                self._diag_phase_stats_pre = None
+                for t in range(0, self.task_id + 1):
+                    acc_t, stats_t = self._diag_eval_task(
+                        t, collect_stats=(t == 0)
+                    )
+                    self._diag_phase_acc_pre[f'task{t}'] = acc_t
+                    if t == 0:
+                        self._diag_phase_stats_pre = stats_t
+
             task_hard_usage = self._run_phase2(
                 round, args, train_loader,
                 global_step=ctx['phase2_global_step'],
@@ -506,6 +565,15 @@ class Client_DF:
             self.traindata, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=True
         )
         print(f'Client {self.id} on Task {self.task_id} is training (FedSMR)')
+
+        # =============================================================
+        # E6a-v3b-Diag: Phase1 开始钩子
+        # 位置: 数据/状态初始化完成、Phase1 第一个优化步之前。
+        # 输出各任务 pre_phase1 准确率 + Phase1 前快照（key/anchor/head/
+        # feature/retrieved anchor），用于切分 P1 / P2 两个窗口的漂移。
+        # =============================================================
+        if self._tidr_diag_config is not None:
+            self._tidr_diag_phase1_start(round, args)
 
         # 计算总步数（用于温度退火）
         total_steps = self.local_epoch * len(train_loader)
@@ -598,7 +666,38 @@ class Client_DF:
             skip_start_hook: CP2 恢复时跳过 Phase2 开始钩子（快照已在恢复时注入）
         """
         self.model.train()  # usage 只在训练模式累积
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
+        # =============================================================
+        # E6a-v3a-Diag: No-Anchor-WD
+        # 诊断实验（默认关闭）: Phase2 中 anchor_pool 免 weight decay。
+        # No-Anchor-WD is used to test whether weight decay is the primary
+        # driver of old-anchor norm collapse during Phase2.
+        # （旧 Anchor 行并非只剩 WD 梯度——仍可能收到 temporal / diversity /
+        #   少量 route 等任务梯度；但 WD × Adam 自适应归一化是范数塌缩的
+        #   主驱动，已由 E6a-v3a 因果验证: norm_ratio 0.0102→1.0031）
+        # =============================================================
+        if self.anchor_no_wd and hasattr(self.model, 'anchor_pool'):
+            anchor_param = self.model.anchor_pool
+            other_params = [
+                p for p in self.model.parameters()
+                if p is not anchor_param
+            ]
+            optimizer = torch.optim.Adam(
+                [
+                    {
+                        'params': other_params,
+                        'weight_decay': 1e-3,
+                    },
+                    {
+                        'params': [anchor_param],
+                        'weight_decay': 0.0,
+                    },
+                ],
+                lr=self.lr,
+            )
+            print("[E6a-v3a-Diag] Phase2 optimizer: anchor_pool "
+                  "weight_decay=0 (No-Anchor-WD), other params wd=1e-3")
+        else:
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
         # =============================================================
@@ -629,10 +728,13 @@ class Client_DF:
                     ).item()
 
         # =============================================================
-        # E6a-v2-Diag: Phase2 开始钩子（CP2 保存点）
+        # E6a-v2-Diag / E6a-v3b-Diag: Phase2 开始钩子
         # 位于 Phase2 全部初始化之后、第一个 batch 之前
+        # （诊断配置 → CP2 保存点 + 快照；Task Checkpoint 配置 →
+        #   Task{k}_C0_post_phase1.pth 保存点）
         # =============================================================
-        if self._tidr_diag_config is not None and not skip_start_hook:
+        if (self._tidr_diag_config is not None
+                and not skip_start_hook):
             head_id_before = id(self.model.head)
 
             self._tidr_diag_phase2_start(round, args, global_step, total_steps)
@@ -653,6 +755,10 @@ class Client_DF:
             print(f"[TIDR-Safety] head_object_preserved={head_id_before == head_id_after} "
                   f"model_training={self.model.training} "
                   f"optimizer_has_current_head={optimizer_has_current_head}")
+        elif (self._task_ckpt_config is not None
+              and not skip_start_hook):
+            # 仅 Task Checkpoint（诊断关闭）: 只保存，不做评估
+            self._task_ckpt_phase2_start(round, args, global_step, total_steps)
 
         # E6a-v2-Diag: 优化步数统计（StepDiag，默认关闭时零开销）
         diag_steps_active = self._tidr_diag_config is not None
@@ -691,6 +797,15 @@ class Client_DF:
 
                 # E1-Repair v1: sample-weighted routing diagnostics
                 task_hard_usage += torch.bincount(hard_idx, minlength=self.nb_classes).float()
+
+                # E6a-v2-Diag: Task1 样本 hard route 到旧类 Anchor 的比例
+                # （判断旧 Anchor 漂移来自 Task1 CE 直接更新还是 MSP diversity 全局梯度）
+                if self._tidr_diag_config is not None and self._diag_old_key_mask is not None:
+                    old_mask_dev = self._diag_old_key_mask.to(hard_idx.device)
+                    self._diag_task1_old_route_hits += (
+                        old_mask_dev[hard_idx.detach()].sum().item()
+                    )
+                    self._diag_task1_old_route_total += hard_idx.numel()
 
                 if self.use_soft_anchor:
                     attn_det = attn_weights.detach()
@@ -916,12 +1031,15 @@ class Client_DF:
         self.heads[self.task_id] = deepcopy(self.model.get_head())
 
         # =============================================================
-        # E6a-v2-Diag: Phase2 结束钩子
+        # E6a-v2-Diag / E6a-v3b-Diag: Phase2 结束钩子
         # PhaseDiag post / StepDiag / FeatureDiag / KeyCF Rollback /
-        # Classwise CSV / CP3 保存（本地、服务器聚合之前 → Local 范畴）
+        # Classwise CSV / CP3 保存（本地、服务器聚合之前 → Local 范畴）；
+        # Task Checkpoint 配置（诊断关闭）→ Task{k}_C0_post_phase2.pth
         # =============================================================
         if self._tidr_diag_config is not None:
             self._tidr_diag_phase2_end(round, args)
+        elif self._task_ckpt_config is not None:
+            self._task_ckpt_phase2_end(round, args)
 
         # Evaluate after training
         if self.task_id == 0:
@@ -941,10 +1059,159 @@ class Client_DF:
     #   全程 model.eval() + torch.no_grad()，不产生梯度、不污染训练/聚合）
     # =============================================================
 
+    def _tidr_diag_phase1_start(self, round, args):
+        """
+        E6a-v3b-Diag: Phase1 开始钩子（任务首轮注入诊断配置时执行）
+        位置: 数据/状态初始化完成、Phase1 第一个优化步之前。
+
+        1) 各任务 pre_phase1 准确率（上一 Task 结束、聚合分发后的状态）
+        2) Phase1 前快照: key / anchor_pool / model.head / heads[t] /
+           固定 Task0 样本 feature / retrieved anchor_feat
+           （用于切分 P1 / P2 两个窗口的漂移归因）
+
+        只读诊断：train/eval 状态与 RNG 由各 _diag_* 函数内部恢复。
+        """
+        # 跨轮计数器复位（诊断轮不再只有 Round5 一次）
+        self._diag_task1_old_route_hits = 0
+        self._diag_task1_old_route_total = 0
+        self._diag_step_stats = None
+
+        # ---- 1) pre_phase1 准确率（0..task_id 全部任务） ----
+        # 注意解释口径（v3b-Diag r2 改名）: 该点位于 task switch 之后
+        # （task_id 已更新、update_data/状态初始化/prompt 加载已完成）、
+        # Phase1 第一个优化步之前，即 post-task-switch / pre-Phase1，
+        # 不是上一轮结束时的旧 task-stage 状态。评估协议
+        # vit(task_id=self.task_id) 已使用新任务 stage——若 task switch
+        # 本身改变 prompt-stage 行为，Task0 可能在一个优化步都没跑
+        # 之前就先掉。若出现 R9 end=88.86 → pre-P1=40 → post-P1=39，
+        # 结论应是 "collapse occurs at the Task1→Task2 boundary before
+        # Phase1 optimization"，而非 "Phase1 打崩了"。
+        accs = {}
+        for t in range(0, self.task_id + 1):
+            accs[f'task{t}'] = self._diag_eval_task(t, collect_stats=False)[0]
+        self._diag_phase_acc_pre_p1 = accs
+        fields = ' '.join(
+            f"task{t}_acc_post_task_switch_pre_phase1={accs[f'task{t}']:.2f}"
+            for t in range(0, self.task_id + 1)
+        )
+        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} {fields}")
+
+        # ---- 2) Phase1 前快照 ----
+        self._diag_key_pre_p1 = self.model.key.data.clone().cpu()
+        self._diag_anchor_pre_p1 = self.model.anchor_pool.data.clone().cpu()
+        self._diag_head_pre_p1 = {
+            k: v.detach().clone().cpu()
+            for k, v in self.model.head.state_dict().items()
+        }
+        self._diag_heads_pre_p1 = {}
+        for t in range(self.task_id):
+            if self.heads[t] is not None:
+                self._diag_heads_pre_p1[t] = {
+                    k: v.detach().clone().cpu()
+                    for k, v in self.heads[t].state_dict().items()
+                }
+        # 幂等: indices 已存在但 fixed tensors 缺失（旧 checkpoint 恢复）
+        # 时会用已有 indices 重新缓存张量（内部含 RNG 保护）
+        self._ensure_diag_fixed_inputs()
+        self._diag_feature_pre_p1 = self._diag_extract_features()
+        self._diag_anchor_feat_pre_p1 = self._diag_extract_anchor_feat()
+
+    def _diag_print_p1_drift(self):
+        """
+        E6a-v3b-Diag: Phase1 窗口漂移（pre_phase1 → post_phase1）
+        在 phase2_start 钩子中调用（此时 Phase1 已结束）。
+        Phase1 只训练 ViT/Prompt: key/anchor/head 预期不变（验证），
+        feature / retrieved anchor_feat 预期漂移（ViT 表示变化）。
+        """
+        if (self._diag_feature_pre_p1 is None
+                or self._diag_feature_before is None
+                or len(self.old_seen_classes) == 0):
+            return  # 无 pre_phase1 快照（CP2 恢复 / standalone）
+
+        old_idx = torch.tensor(
+            sorted(self.old_seen_classes),
+            dtype=torch.long, device=self.device
+        )
+
+        # ---- key / anchor（Phase1 不应触碰，预期 drift≈0） ----
+        key_pre = F.normalize(
+            self._diag_key_pre_p1.to(self.device)[old_idx], dim=1)
+        key_now = F.normalize(
+            self.model.key.detach()[old_idx], dim=1)
+        key_drift = 1.0 - (key_pre * key_now).sum(dim=1)
+
+        a_pre = self._diag_anchor_pre_p1.to(self.device)[old_idx]
+        a_now = self.model.anchor_pool.detach()[old_idx]
+        a_cos = 1.0 - F.cosine_similarity(a_pre, a_now, dim=1)
+        a_nr = a_now.norm(dim=1) / a_pre.norm(dim=1).clamp_min(1e-8)
+
+        # ---- head（Phase1 不训练 head，预期不变） ----
+        head_now = self.model.head.state_dict()
+        head_l2_p1 = 0.0
+        for k, v in self._diag_head_pre_p1.items():
+            head_l2_p1 = max(
+                head_l2_p1,
+                (head_now[k].detach().cpu() - v).abs().max().item()
+            )
+        heads_max_p1 = 0.0
+        for t, sd in self._diag_heads_pre_p1.items():
+            cur = self.heads[t].state_dict()
+            for k, v in sd.items():
+                heads_max_p1 = max(
+                    heads_max_p1,
+                    (cur[k].detach().cpu() - v).abs().max().item()
+                )
+
+        # ---- feature / retrieved anchor_feat（P1 窗口核心指标） ----
+        fb = self._diag_feature_pre_p1.to(self.device)
+        fa = self._diag_feature_before.to(self.device)
+        f_drift = 1.0 - F.cosine_similarity(fb, fa, dim=1)
+
+        ab = self._diag_anchor_feat_pre_p1.to(self.device)
+        aa = self._diag_anchor_feat_before_phase2.to(self.device)
+        af_cos = 1.0 - F.cosine_similarity(ab, aa, dim=1)
+        af_nr = aa.norm(dim=1) / ab.norm(dim=1).clamp_min(1e-8)
+        af_l2 = (aa - ab).norm(dim=1)
+
+        print(f"[TIDR-P1Drift] client={self.id} task={self.task_id} "
+              f"mean_old_key_drift_p1={key_drift.mean().item():.6f} "
+              f"mean_old_anchor_cos_drift_p1={a_cos.mean().item():.6f} "
+              f"mean_old_anchor_norm_ratio_p1={a_nr.mean().item():.6f} "
+              f"head_max_change_p1={head_l2_p1:.6f} "
+              f"old_heads_max_change_p1={heads_max_p1:.6f} "
+              f"mean_old_feature_drift_p1={f_drift.mean().item():.6f} "
+              f"max_old_feature_drift_p1={f_drift.max().item():.6f} "
+              f"mean_retrieved_anchor_cos_drift_p1={af_cos.mean().item():.6f} "
+              f"mean_retrieved_anchor_norm_ratio_p1={af_nr.mean().item():.6f} "
+              f"mean_retrieved_anchor_l2_drift_p1={af_l2.mean().item():.6f}")
+
+    def _diag_snapshot_extras(self):
+        """
+        E6a-v3b-Diag: 诊断快照（写入 checkpoint extras）
+        使离线恢复（CP2 / Task post-P1 / Task post-P2 / standalone）能
+        完整复现 P1Drift / HeadDrift / RetrievedAnchorDrift 与固定输入
+        （否则只存 indices 时随机增强会让 drift 混入 augmentation noise，
+          且 pre_p1 快照缺失导致离线 P1 窗口不可复现）。
+        """
+        return {
+            'anchor_feat_before_phase2': self._diag_anchor_feat_before_phase2,
+            'feature_pre_p1': self._diag_feature_pre_p1,
+            'anchor_feat_pre_p1': self._diag_anchor_feat_pre_p1,
+            'key_pre_p1': self._diag_key_pre_p1,
+            'anchor_pre_p1': self._diag_anchor_pre_p1,
+            'head_pre_p1': self._diag_head_pre_p1,
+            'heads_pre_p1': self._diag_heads_pre_p1,
+            'fixed_inputs': self._diag_fixed_inputs,
+            'fixed_targets': self._diag_fixed_targets,
+        }
+
     def _tidr_diag_phase2_start(self, round, args, global_step, total_steps):
         """
-        E6a-v2-Diag: Phase2 开始钩子
+        E6a-v2-Diag / E6a-v3b-Diag: Phase2 开始钩子
         位置: Phase1 结束、Phase2 全部初始化完成、第一个 batch 之前（CP2 保存点）
+
+        E6a-v3b-Diag 扩展: pre_phase2 评估从 Task0/Task1 扩展到 0..task_id
+        全部任务；新增 retrieved anchor_feat 快照与 P1 窗口漂移输出。
         """
         cfg = self._tidr_diag_config
 
@@ -952,67 +1219,187 @@ class Client_DF:
         #    old-key 定义与 TIDR-KeyDiag 完全一致: old_seen_classes
         #    （= 已见类别 - 当前任务类别，任务间共享类别自动排除）
         self._diag_key_before_phase2 = self.model.key.data.clone().cpu()
+        # Anchor 快照（Phase2 前旧 Anchor，AnchorCF / AnchorDrift 用）
+        self._diag_anchor_before_phase2 = self.model.anchor_pool.data.clone().cpu()
         old_idx = sorted(self.old_seen_classes)
         old_key_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
         if old_idx:
             old_key_mask[torch.tensor(old_idx, dtype=torch.long)] = True
         self._diag_old_key_mask = old_key_mask
 
-        # 2) PhaseDiag pre: 用当前 Task1-stage 表示评估 Task0 / Task1
+        # 2) PhaseDiag pre（= post_phase1）: 评估 0..task_id 全部任务
         #    （评估协议镜像 evaluate(): vit(task_id=self.task_id), heads[task]）
-        acc0_pre, stats0_pre = self._diag_eval_task(0, collect_stats=True)
-        acc1_pre, _ = self._diag_eval_task(1, collect_stats=False)
-        self._diag_phase_acc_pre = {'task0': acc0_pre, 'task1': acc1_pre}
+        accs = {}
+        stats0_pre = None
+        for t in range(0, self.task_id + 1):
+            acc_t, stats_t = self._diag_eval_task(t, collect_stats=(t == 0))
+            accs[f'task{t}'] = acc_t
+            if t == 0:
+                stats0_pre = stats_t
+        self._diag_phase_acc_pre = accs
         self._diag_phase_stats_pre = stats0_pre
-        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} "
-              f"task0_acc_pre_phase2={acc0_pre:.2f} "
-              f"task1_acc_pre_phase2={acc1_pre:.2f}")
+        fields = ' '.join(
+            f"task{t}_acc_pre_phase2={accs[f'task{t}']:.2f} "
+            f"(=post_phase1)"
+            for t in range(0, self.task_id + 1)
+        )
+        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} {fields}")
 
         # 3) FeatureDrift: 固定 Task0 测试样本 + Phase2 前特征快照
         #    （实际参与 Key routing 的 query = vit forward_head 的 feat）
-        if self._diag_feature_samples is None:
-            self._diag_capture_feature_samples()
+        # 幂等: indices 已存在但 fixed tensors 缺失（旧 checkpoint 恢复）
+        # 时会用已有 indices 重新缓存张量（内部含 RNG 保护）
+        self._ensure_diag_fixed_inputs()
         self._diag_feature_before = self._diag_extract_features()
 
-        # 4) CP2 保存
+        # 3b) Retrieved anchor feature 快照（post-P1 点）
+        self._diag_anchor_feat_before_phase2 = self._diag_extract_anchor_feat()
+
+        # 3c) P1 窗口漂移（pre_phase1 → post_phase1）
+        self._diag_print_p1_drift()
+
+        # 4) CP2 保存（仅 CF 轮）
         if cfg.get('save'):
             extras = {
                 'key_before_phase2': self._diag_key_before_phase2,
+                'anchor_before_phase2': self._diag_anchor_before_phase2,
                 'old_key_mask': self._diag_old_key_mask,
                 'phase2_global_step': global_step,
                 'total_steps': total_steps,
                 'phase_acc_pre': dict(self._diag_phase_acc_pre),
+                'phase_acc_pre_p1': dict(self._diag_phase_acc_pre_p1 or {}),
                 'phase_stats_pre': self._diag_phase_stats_pre,
                 'feature_before': self._diag_feature_before,
                 'feature_sample_indices': list(self._diag_feature_samples),
             }
-            save_checkpoint(cfg['server'], 'R5_C0_pre_phase2', CKPT_CP2, round, extras)
+            extras.update(self._diag_snapshot_extras())
+            # 文件名跟随实际 round（默认 Round5 时与 CKPT_CP2 一致，向后兼容）
+            save_checkpoint(cfg['server'], 'R5_C0_pre_phase2',
+                            f'R{round}_C0_pre_phase2.pth', round, extras)
+
+        # 5) Task Checkpoint: Task{k}_C0_post_phase1.pth
+        if self._task_ckpt_config is not None and self._task_ckpt_config.get('save'):
+            extras = {
+                'diag_task': self.task_id,
+                'diag_round': round,
+                'key_before_phase2': self._diag_key_before_phase2,
+                'anchor_before_phase2': self._diag_anchor_before_phase2,
+                'old_key_mask': self._diag_old_key_mask,
+                'phase2_global_step': global_step,
+                'total_steps': total_steps,
+                'phase_acc_pre': dict(self._diag_phase_acc_pre),
+                'phase_acc_pre_p1': dict(self._diag_phase_acc_pre_p1 or {}),
+                'feature_before': self._diag_feature_before,
+                'feature_sample_indices': list(self._diag_feature_samples),
+            }
+            extras.update(self._diag_snapshot_extras())
+            save_checkpoint(
+                self._task_ckpt_config['server'], 'Task_C0_post_phase1',
+                f"Task{self.task_id}_C0_post_phase1.pth", round, extras
+            )
 
         if cfg.get('stop_at') == 'R5_C0_pre_phase2':
             raise DiagStopException('R5_C0_pre_phase2')
 
+    def _task_ckpt_phase2_start(self, round, args, global_step, total_steps):
+        """
+        E6a-v3b-Diag: Task{k}_C0_post_phase1.pth 保存
+        （仅 --save_task_checkpoints、诊断关闭时的轻量路径：只快照不评估）
+        """
+        cfg = self._task_ckpt_config
+        self._diag_key_before_phase2 = self.model.key.data.clone().cpu()
+        self._diag_anchor_before_phase2 = self.model.anchor_pool.data.clone().cpu()
+        old_idx = sorted(self.old_seen_classes)
+        old_key_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
+        if old_idx:
+            old_key_mask[torch.tensor(old_idx, dtype=torch.long)] = True
+        self._diag_old_key_mask = old_key_mask
+        # 幂等: indices 已存在但 fixed tensors 缺失（旧 checkpoint 恢复）
+        # 时会用已有 indices 重新缓存张量（内部含 RNG 保护）
+        self._ensure_diag_fixed_inputs()
+
+        extras = {
+            'diag_task': self.task_id,
+            'diag_round': round,
+            'key_before_phase2': self._diag_key_before_phase2,
+            'anchor_before_phase2': self._diag_anchor_before_phase2,
+            'old_key_mask': self._diag_old_key_mask,
+            'phase2_global_step': global_step,
+            'total_steps': total_steps,
+            # P2 窗口 retrieved-anchor drift 基线 + 固定输入张量
+            'anchor_feat_before_phase2': self._diag_extract_anchor_feat(),
+            'feature_before': self._diag_extract_features(),
+            'feature_sample_indices': list(self._diag_feature_samples),
+            'fixed_inputs': self._diag_fixed_inputs,
+            'fixed_targets': self._diag_fixed_targets,
+        }
+        save_checkpoint(
+            cfg['server'], 'Task_C0_post_phase1',
+            f"Task{self.task_id}_C0_post_phase1.pth", round, extras
+        )
+
+    def _task_ckpt_phase2_end(self, round, args):
+        """
+        E6a-v3b-Diag: Task{k}_C0_post_phase2.pth 保存
+        （仅 --save_task_checkpoints、诊断关闭时的轻量路径）
+        key/anchor 快照来自 _task_ckpt_phase2_start（pre-Phase2）
+        """
+        cfg = self._task_ckpt_config
+        if self._diag_key_before_phase2 is None:
+            self._diag_key_before_phase2 = self.model.key.data.clone().cpu()
+        if self._diag_anchor_before_phase2 is None:
+            self._diag_anchor_before_phase2 = self.model.anchor_pool.data.clone().cpu()
+
+        extras = {
+            'diag_task': self.task_id,
+            'diag_round': round,
+            'key_before_phase2': self._diag_key_before_phase2,
+            'key_after_phase2': self.model.key.data.clone().cpu(),
+            'anchor_before_phase2': self._diag_anchor_before_phase2,
+            'old_key_mask': self._diag_old_key_mask,
+            'feature_sample_indices': list(self._diag_feature_samples or []),
+        }
+        save_checkpoint(
+            cfg['server'], 'Task_C0_post_phase2',
+            f"Task{self.task_id}_C0_post_phase2.pth", round, extras
+        )
+
     def _tidr_diag_phase2_end(self, round, args):
         """
-        E6a-v2-Diag: Phase2 结束钩子（本地、服务器聚合之前 → Local 范畴）
-        PhaseDiag post / StepDiag / FeatureDiag / KeyCF Rollback /
-        Old-Old 诊断（Normal & Rollback）/ Classwise CSV / CP3 保存
+        E6a-v2-Diag / E6a-v3b-Diag: Phase2 结束钩子（本地、服务器聚合之前）
+        PhaseDiag post（0..task_id 全部任务，三点准确率 + P1/P2 变化）/
+        StepDiag / FeatureDiag / HeadDrift / RetrievedAnchorDrift /
+        RetrievalCF（Seen-only / Exclude-current / Prev-seen-only / T0-only）/
+        [CF 轮] KeyCF / AnchorCF / NormCF / DirCF / JointCF /
+        Classwise CSV / CP3 保存
         """
         cfg = self._tidr_diag_config
         standalone = bool(cfg.get('standalone'))
+        cf = bool(cfg.get('cf', True))
 
-        # ---- 1) PhaseDiag post ----
-        acc0_post, stats0_post = self._diag_eval_task(0, collect_stats=True)
-        acc1_post, _ = self._diag_eval_task(1, collect_stats=False)
+        # ---- 1) PhaseDiag post: 评估 0..task_id 全部任务 ----
+        post_accs = {}
+        stats0_post = None
+        for t in range(0, self.task_id + 1):
+            acc_t, stats_t = self._diag_eval_task(t, collect_stats=(t == 0))
+            post_accs[f'task{t}'] = acc_t
+            if t == 0:
+                stats0_post = stats_t
         pre = self._diag_phase_acc_pre or {}
-        acc0_pre = pre.get('task0', float('nan'))
-        acc1_pre = pre.get('task1', float('nan'))
-        print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} "
-              f"task0_acc_pre_phase2={acc0_pre:.2f} "
-              f"task0_acc_post_phase2={acc0_post:.2f} "
-              f"task0_acc_change={acc0_post - acc0_pre:+.2f} "
-              f"task1_acc_pre_phase2={acc1_pre:.2f} "
-              f"task1_acc_post_phase2={acc1_post:.2f} "
-              f"task1_acc_change={acc1_post - acc1_pre:+.2f}")
+        pre_p1 = self._diag_phase_acc_pre_p1 or {}
+        for t in range(0, self.task_id + 1):
+            a_p1 = pre_p1.get(f'task{t}', float('nan'))
+            a_pre = pre.get(f'task{t}', float('nan'))
+            a_post = post_accs[f'task{t}']
+            print(f"[TIDR-PhaseDiag] client={self.id} task={self.task_id} "
+                  f"task{t}_acc_post_task_switch_pre_phase1={a_p1:.2f} "
+                  f"task{t}_acc_post_phase1={a_pre:.2f} "
+                  f"task{t}_acc_post_phase2={a_post:.2f} "
+                  f"task{t}_acc_p1_change={a_pre - a_p1:+.2f} "
+                  f"task{t}_acc_p2_change={a_post - a_pre:+.2f} "
+                  f"task{t}_acc_total_change={a_post - a_p1:+.2f}")
+
+        acc0_post = post_accs['task0']
 
         # ---- 2) StepDiag ----
         if self._diag_step_stats is not None:
@@ -1023,9 +1410,18 @@ class Client_DF:
                   f"phase2_num_samples={s['phase2_num_samples']} "
                   f"phase2_mean_batch_size={s['phase2_mean_batch_size']:.2f}")
 
-        # ---- 3) FeatureDiag（同一批固定 Task0 样本、相同 task_id） ----
-        if self._diag_feature_samples is None:
-            self._diag_capture_feature_samples()
+        # 当前任务样本 → 旧类 Anchor 的 hard route 比例
+        # （仅正常链路，standalone 无 Phase2）
+        if self._diag_task1_old_route_total > 0:
+            rate = self._diag_task1_old_route_hits / self._diag_task1_old_route_total
+            print(f"[TIDR-AnchorRouteDiag] client={self.id} task={self.task_id} "
+                  f"cur_task_to_any_old_anchor_rate={rate:.4f} "
+                  f"({self._diag_task1_old_route_hits}/{self._diag_task1_old_route_total})")
+
+        # ---- 3) FeatureDiag: P2 窗口（同一批固定 Task0 样本、相同 task_id） ----
+        # 幂等: indices 已存在但 fixed tensors 缺失（旧 checkpoint 恢复）
+        # 时会用已有 indices 重新缓存张量（内部含 RNG 保护）
+        self._ensure_diag_fixed_inputs()
         self._diag_feature_after = self._diag_extract_features()
         if self._diag_feature_before is not None:
             fb = self._diag_feature_before.to(self.device)
@@ -1039,7 +1435,53 @@ class Client_DF:
                   f"max_old_feature_drift={drift.max().item():.6f} "
                   f"p95_old_feature_drift={p95_drift:.6f}")
 
-        # ---- 4) KeyCF: Old-Key Rollback 反事实实验 ----
+        # ---- 3b) RetrievedAnchorDrift: P2 窗口 retrieved anchor 表征漂移 ----
+        # raw Anchor 参数没坏 ≠ 送进 head 的检索表征没坏（attn 分布变化
+        # 会使 soft_anchor 混入新任务 Anchor）
+        if self._diag_anchor_feat_before_phase2 is not None:
+            anchor_feat_after = self._diag_extract_anchor_feat()
+            self._diag_anchor_feat_after_phase2 = anchor_feat_after
+            ab = self._diag_anchor_feat_before_phase2.to(self.device)
+            aa = anchor_feat_after.to(self.device)
+            af_cos = 1.0 - F.cosine_similarity(ab, aa, dim=1)
+            af_nr = aa.norm(dim=1) / ab.norm(dim=1).clamp_min(1e-8)
+            af_l2 = (aa - ab).norm(dim=1)
+            print(f"[TIDR-RetrievedAnchorDrift] client={self.id} "
+                  f"task={self.task_id} "
+                  f"mean_retrieved_anchor_cos_drift_p2={af_cos.mean().item():.6f} "
+                  f"max_retrieved_anchor_cos_drift_p2={af_cos.max().item():.6f} "
+                  f"mean_retrieved_anchor_norm_ratio_p2={af_nr.mean().item():.6f} "
+                  f"mean_retrieved_anchor_l2_drift_p2={af_l2.mean().item():.6f}")
+
+        # ---- 3c) HeadDrift: model.head / heads[t] 漂移 ----
+        # 注意解释口径: Task0 评估用的是冻结快照 heads[0]，不是当前
+        # model.head（Phase2 正在训练的当前任务 head）。
+        # 因此 task0_snapshot_head_change 应严格为 0（若非 0 = 快照被
+        # 意外篡改，是 bug 信号）；current_train_head_change 大本身
+        # 不能解释 Task0 遗忘，只反映当前任务 head 的正常训练幅度。
+        if self._diag_head_pre_p1 is not None:
+            head_now = self.model.head.state_dict()
+            head_max_total = 0.0
+            for k, v in self._diag_head_pre_p1.items():
+                head_max_total = max(
+                    head_max_total,
+                    (head_now[k].detach().cpu() - v).abs().max().item()
+                )
+            task0_head_change = 0.0
+            old_heads_max_total = 0.0
+            for t, sd in (self._diag_heads_pre_p1 or {}).items():
+                cur = self.heads[t].state_dict()
+                for k, v in sd.items():
+                    ch = (cur[k].detach().cpu() - v).abs().max().item()
+                    if t == 0:
+                        task0_head_change = max(task0_head_change, ch)
+                    old_heads_max_total = max(old_heads_max_total, ch)
+            print(f"[TIDR-HeadDriftDiag] client={self.id} task={self.task_id} "
+                  f"current_train_head_change={head_max_total:.6f} "
+                  f"task0_snapshot_head_change={task0_head_change:.6f} "
+                  f"all_old_snapshot_heads_max_change={old_heads_max_total:.6f}")
+
+        # ---- 4) Routing stats（Normal） ----
         acc_normal = acc0_post
         metrics_normal = self._format_diag_stats(stats0_post) if stats0_post else None
         if metrics_normal:
@@ -1048,10 +1490,207 @@ class Client_DF:
         key_after = self.model.key.data.clone().cpu()
         self._diag_key_after_phase2 = key_after
 
+        # ---- 4e) RetrievalCF: 检索污染反事实（诊断专用，非算法） ----
+        # 四组掩码（评 Task0；softmax 自然重归一化）:
+        #   Seen-only:           只允许 T0..T{task_id}（含当前任务）
+        #                        → Normal 的 recovery = future unseen 污染
+        #   Exclude-current-only: 允许全部类别但屏蔽当前任务类
+        #                        → recovery = 当前任务（如 T2）单独污染
+        #                          （保留 future，与 prev-seen-only 区分）
+        #   Previous-seen-only:  只允许 union(class_mask[0..task_id-1])
+        #                        → recovery = 当前任务 + future 联合污染
+        #                        （语义上严格于 old_seen_classes = seen-current，
+        #                          任务间共享类时两者不等价）
+        #   T0-only:             只允许 Task0 keys/anchors
+        # 实现方式: 临时开启 use_seen_routing 并替换 seen_class_mask
+        # （try/finally 完整恢复，不改变训练行为）
+        prev_seen_classes = sorted(set().union(*[
+            set(int(c) for c in self.class_mask[k])
+            for k in range(0, self.task_id)
+        ])) if self.task_id > 0 else []
+        if len(prev_seen_classes) > 0:
+            cf_parts = [f"acc_normal={acc_normal:.2f}"]
+
+            # Seen-only: T0..T{task_id}（future unseen 存在时才有意义）
+            seen_classes_cf = sorted(set().union(*[
+                set(int(c) for c in self.class_mask[k])
+                for k in range(0, self.task_id + 1)
+            ]))
+            if len(seen_classes_cf) < self.nb_classes:
+                seen_only_mask = torch.zeros(
+                    self.nb_classes, dtype=torch.bool)
+                seen_only_mask[torch.tensor(
+                    seen_classes_cf, dtype=torch.long)] = True
+                acc_seen_only, _ = self._diag_eval_task(
+                    0, collect_stats=False,
+                    retrieval_allowed_mask=seen_only_mask
+                )
+                cf_parts.append(
+                    f"acc_seen_only={acc_seen_only:.2f} "
+                    f"recovery_seen_only={acc_seen_only - acc_normal:+.2f}")
+
+            # Exclude-current-only: 全部类别 - 当前任务类（保留 future）
+            # 口径 = current-exclusive（C_current - union(C_0..C_cur-1)）:
+            # 互斥任务下与 "C_current - C_eval" 等价；跨任务共享类数据集
+            # 下更严格——已在早期任务出现过的共享类不会被误算成
+            # "当前任务单独污染"（它们仍被允许检索）。
+            prev_cls_cf = set().union(*[
+                set(int(c) for c in self.class_mask[k])
+                for k in range(0, self.task_id)
+            ]) if self.task_id > 0 else set()
+            cur_only_classes = sorted(
+                int(c) for c in self.class_mask[self.task_id]
+                if int(c) not in prev_cls_cf
+            )
+            if len(cur_only_classes) > 0:
+                excl_cur_mask = torch.ones(
+                    self.nb_classes, dtype=torch.bool)
+                excl_cur_mask[torch.tensor(
+                    cur_only_classes, dtype=torch.long)] = False
+                acc_excl_cur, _ = self._diag_eval_task(
+                    0, collect_stats=False,
+                    retrieval_allowed_mask=excl_cur_mask
+                )
+                cf_parts.append(
+                    f"acc_exclude_current={acc_excl_cur:.2f} "
+                    f"recovery_exclude_current={acc_excl_cur - acc_normal:+.2f}")
+
+            # Previous-seen-only
+            old_only_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
+            old_only_mask[torch.tensor(
+                prev_seen_classes, dtype=torch.long)] = True
+            acc_old_only, _ = self._diag_eval_task(
+                0, collect_stats=False,
+                retrieval_allowed_mask=old_only_mask
+            )
+            cf_parts.append(
+                f"acc_prev_seen_only={acc_old_only:.2f} "
+                f"recovery_prev_seen_only={acc_old_only - acc_normal:+.2f}")
+
+            # T0-only
+            t0_only_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
+            t0_only_mask[torch.tensor(
+                self.class_mask[0], dtype=torch.long)] = True
+            acc_t0_only, _ = self._diag_eval_task(
+                0, collect_stats=False,
+                retrieval_allowed_mask=t0_only_mask
+            )
+            cf_parts.append(
+                f"acc_t0_only={acc_t0_only:.2f} "
+                f"recovery_t0_only={acc_t0_only - acc_normal:+.2f}")
+
+            print(f"[TIDR-RetrievalCF] client={self.id} task={self.task_id} "
+                  + ' '.join(cf_parts))
+
+        # ============================================================
+        # 以下为完整反事实套件（仅 CF 轮 / standalone）
+        # ============================================================
+        if not cf:
+            # 轻量 PhaseDiag 轮: 跳过 Key/Anchor/Joint CF 与 CP3
+            if (self._task_ckpt_config is not None
+                    and self._task_ckpt_config.get('save')):
+                extras = {
+                    'diag_task': self.task_id,
+                    'diag_round': round,
+                    'key_before_phase2': self._diag_key_before_phase2,
+                    'key_after_phase2': key_after,
+                    'anchor_before_phase2': self._diag_anchor_before_phase2,
+                    'old_key_mask': self._diag_old_key_mask,
+                    'phase_acc_pre': dict(self._diag_phase_acc_pre or {}),
+                    'phase_acc_pre_p1': dict(self._diag_phase_acc_pre_p1 or {}),
+                    'phase_acc_post': dict(post_accs),
+                    'feature_before': self._diag_feature_before,
+                    'feature_after': self._diag_feature_after,
+                    'feature_sample_indices': list(self._diag_feature_samples or []),
+                    'anchor_feat_after_phase2': self._diag_anchor_feat_after_phase2,
+                }
+                extras.update(self._diag_snapshot_extras())
+                save_checkpoint(
+                    self._task_ckpt_config['server'], 'Task_C0_post_phase2',
+                    f"Task{self.task_id}_C0_post_phase2.pth", round, extras
+                )
+            return
+
+        # ---- 4a) KeyCF: Old-Key Rollback 反事实实验 ----
         acc_rollback, recovery, restoration_pass = self._diag_key_rollback(acc_normal)
         print(f"[TIDR-KeyCF] client={self.id} task={self.task_id} "
               f"acc_normal={acc_normal:.2f} acc_rollback={acc_rollback:.2f} "
               f"recovery={recovery:+.2f} key_restoration_pass={restoration_pass}")
+
+        # ---- 4b) AnchorDrift: 旧 Anchor Phase2 前后漂移度量 ----
+        # anchor_before 来源优先级: phase2_start 快照 > prev_anchor_pool
+        # （prev_anchor_pool 在本轮开始时 clone 保存，Phase1 只优化 ViT/Prompt，
+        #   不修改 Tail Anchor，因此等价于 Phase2 前 Anchor）
+        anchor_before = self._diag_anchor_before_phase2
+        if anchor_before is None and self.prev_anchor_pool is not None:
+            anchor_before = self.prev_anchor_pool
+            self._diag_anchor_before_phase2 = anchor_before
+
+        if anchor_before is not None and len(self.old_seen_classes) > 0:
+            old_idx_a = torch.tensor(
+                sorted(self.old_seen_classes),
+                dtype=torch.long,
+                device=self.device
+            )
+            ab = anchor_before.to(self.device).index_select(0, old_idx_a)
+            aa = self.model.anchor_pool.detach().index_select(0, old_idx_a)
+
+            cos_drift = 1.0 - F.cosine_similarity(ab, aa, dim=1)
+            cd_sorted = cos_drift.sort().values
+            n_a = cd_sorted.numel()
+            norm_ratio = aa.norm(dim=1) / ab.norm(dim=1).clamp_min(1e-8)
+            nr_sorted = norm_ratio.sort().values
+            l2_drift = (aa - ab).norm(dim=1)
+
+            print(f"[TIDR-AnchorDrift] client={self.id} task={self.task_id} "
+                  f"mean_old_anchor_cos_drift={cos_drift.mean().item():.6f} "
+                  f"median_old_anchor_cos_drift={cd_sorted[n_a // 2].item():.6f} "
+                  f"p95_old_anchor_cos_drift={cd_sorted[min(n_a - 1, int(0.95 * n_a))].item():.6f} "
+                  f"max_old_anchor_cos_drift={cos_drift.max().item():.6f} "
+                  f"mean_old_anchor_norm_ratio={norm_ratio.mean().item():.6f} "
+                  f"median_old_anchor_norm_ratio={nr_sorted[n_a // 2].item():.6f} "
+                  f"max_abs_anchor_norm_change={((aa.norm(dim=1) - ab.norm(dim=1)).abs().max()).item():.6f} "
+                  f"mean_old_anchor_l2_drift={l2_drift.mean().item():.6f}")
+
+        # ---- 4c) Anchor 反事实组: Full / Norm-only / Direction-only ----
+        if anchor_before is not None and len(self.old_seen_classes) > 0:
+            acc_arb, a_recovery, a_restoration, _ = self._diag_anchor_cf(
+                acc_normal, anchor_before, 'full'
+            )
+            print(f"[TIDR-AnchorCF] client={self.id} task={self.task_id} "
+                  f"acc_normal={acc_normal:.2f} acc_anchor_rollback={acc_arb:.2f} "
+                  f"recovery={a_recovery:+.2f} anchor_restoration_pass={a_restoration}")
+
+            # NormCF: 方向保持 Phase2 后，只恢复 Phase2 前范数
+            acc_ncf, n_recovery, n_restoration, _ = self._diag_anchor_cf(
+                acc_normal, anchor_before, 'norm'
+            )
+            print(f"[TIDR-NormCF] client={self.id} task={self.task_id} "
+                  f"acc_normal={acc_normal:.2f} acc_norm_rollback={acc_ncf:.2f} "
+                  f"recovery={n_recovery:+.2f} anchor_restoration_pass={n_restoration}")
+
+            # DirCF: 范数保持 Phase2 后，只恢复 Phase2 前方向
+            acc_dcf, d_recovery, d_restoration, _ = self._diag_anchor_cf(
+                acc_normal, anchor_before, 'dir'
+            )
+            print(f"[TIDR-DirCF] client={self.id} task={self.task_id} "
+                  f"acc_normal={acc_normal:.2f} acc_direction_rollback={acc_dcf:.2f} "
+                  f"recovery={d_recovery:+.2f} anchor_restoration_pass={d_restoration}")
+
+            # JointCF: 旧 Key + 旧 Anchor 同时回滚（检测非线性交互）
+            if self._diag_key_before_phase2 is not None:
+                acc_jcf, j_recovery, j_key_pass, j_anchor_pass = (
+                    self._diag_joint_cf(
+                        acc_normal,
+                        self._diag_key_before_phase2,
+                        anchor_before
+                    )
+                )
+                print(f"[TIDR-JointCF] client={self.id} task={self.task_id} "
+                      f"acc_normal={acc_normal:.2f} acc_joint_rollback={acc_jcf:.2f} "
+                      f"recovery={j_recovery:+.2f} "
+                      f"key_restoration_pass={j_key_pass} "
+                      f"anchor_restoration_pass={j_anchor_pass}")
 
         # ---- 5) Classwise CSV（原始数据，不做因果解释） ----
         try:
@@ -1064,15 +1703,45 @@ class Client_DF:
             extras = {
                 'key_before_phase2': self._diag_key_before_phase2,
                 'key_after_phase2': key_after,
+                'anchor_before_phase2': self._diag_anchor_before_phase2,
                 'old_key_mask': self._diag_old_key_mask,
                 'phase_acc_pre': dict(self._diag_phase_acc_pre or {}),
-                'phase_acc_post': {'task0': acc0_post, 'task1': acc1_post},
+                'phase_acc_pre_p1': dict(self._diag_phase_acc_pre_p1 or {}),
+                'phase_acc_post': dict(post_accs),
                 'phase_stats_pre': self._diag_phase_stats_pre,
                 'feature_before': self._diag_feature_before,
                 'feature_after': self._diag_feature_after,
                 'feature_sample_indices': list(self._diag_feature_samples or []),
+                'anchor_feat_after_phase2': self._diag_anchor_feat_after_phase2,
             }
-            save_checkpoint(cfg['server'], 'R5_C0_post_phase2', CKPT_CP3, round, extras)
+            extras.update(self._diag_snapshot_extras())
+            save_checkpoint(cfg['server'], 'R5_C0_post_phase2',
+                            f'R{round}_C0_post_phase2.pth', round, extras)
+
+        # ---- 6b) Task Checkpoint: Task{k}_C0_post_phase2.pth ----
+        if (self._task_ckpt_config is not None
+                and self._task_ckpt_config.get('save')
+                and not standalone):
+            extras = {
+                'diag_task': self.task_id,
+                'diag_round': round,
+                'key_before_phase2': self._diag_key_before_phase2,
+                'key_after_phase2': key_after,
+                'anchor_before_phase2': self._diag_anchor_before_phase2,
+                'old_key_mask': self._diag_old_key_mask,
+                'phase_acc_pre': dict(self._diag_phase_acc_pre or {}),
+                'phase_acc_pre_p1': dict(self._diag_phase_acc_pre_p1 or {}),
+                'phase_acc_post': dict(post_accs),
+                'feature_before': self._diag_feature_before,
+                'feature_after': self._diag_feature_after,
+                'feature_sample_indices': list(self._diag_feature_samples or []),
+                'anchor_feat_after_phase2': self._diag_anchor_feat_after_phase2,
+            }
+            extras.update(self._diag_snapshot_extras())
+            save_checkpoint(
+                self._task_ckpt_config['server'], 'Task_C0_post_phase2',
+                f"Task{self.task_id}_C0_post_phase2.pth", round, extras
+            )
 
         if cfg.get('stop_at') == 'R5_C0_post_phase2' and not standalone:
             raise DiagStopException('R5_C0_post_phase2')
@@ -1187,7 +1856,256 @@ class Client_DF:
             restoration_pass
         )
 
-    def _diag_eval_task(self, task, collect_stats=False):
+    def _diag_anchor_cf(self, acc_normal, anchor_before, mode):
+        """
+        E6a-v2-Diag: Anchor 反事实实验通用实现（Full / Norm-only / Dir-only）。
+
+        控制变量：
+        - Key / Head / Prompt / Feature 全部保持 Phase2 后状态
+        - 只修改 old_seen_classes 对应的 anchor_pool 行
+
+        mode:
+          'full' — 完整恢复 Phase2 前旧 Anchor（方向 + 范数）
+          'norm' — 方向保持 Phase2 后，只恢复 Phase2 前范数
+                   （钉死"范数坍缩"是否为主要遗忘机制）
+          'dir'  — 范数保持 Phase2 后，只恢复 Phase2 前方向
+                   （方向因素的反事实对照）
+
+        写回使用 index_copy_（in-place），避免 advanced-indexing getitem
+        返回副本导致回滚不生效的陷阱（KeyCF 曾踩过）。
+
+        Returns:
+            (acc_cf, recovery, anchor_restoration_pass, max_abs_change)
+        """
+        if anchor_before is None or len(self.old_seen_classes) == 0:
+            return float('nan'), float('nan'), False, 0.0
+
+        old_idx = torch.tensor(
+            sorted(self.old_seen_classes),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        # Phase2 后完整 anchor_pool 备份
+        anchor_backup = (
+            self.model.anchor_pool
+            .detach()
+            .clone()
+        )
+
+        acc_cf = float('nan')
+        stats_cf = None
+        rollback_applied = False
+        max_abs_change = 0.0
+
+        try:
+            # ========================================================
+            # 构造反事实 Anchor 并写回旧类行
+            # ========================================================
+            with torch.no_grad():
+                ab = (
+                    anchor_before
+                    .to(
+                        device=self.device,
+                        dtype=self.model.anchor_pool.dtype
+                    )
+                    .index_select(0, old_idx)
+                )
+                aa = self.model.anchor_pool.detach().index_select(0, old_idx)
+
+                if mode == 'full':
+                    cf_vals = ab
+                elif mode == 'norm':
+                    # 方向: Phase2 后; 范数: Phase2 前
+                    aa_dir = F.normalize(aa, dim=1)
+                    ab_norm = ab.norm(dim=1, keepdim=True)
+                    cf_vals = aa_dir * ab_norm
+                elif mode == 'dir':
+                    # 方向: Phase2 前; 范数: Phase2 后
+                    ab_dir = F.normalize(ab, dim=1)
+                    aa_norm = aa.norm(dim=1, keepdim=True)
+                    cf_vals = ab_dir * aa_norm
+                else:
+                    raise ValueError(f"unknown mode: {mode}")
+
+                self.model.anchor_pool.index_copy_(
+                    0,
+                    old_idx,
+                    cf_vals
+                )
+
+                # 真实性检查 1: 反事实值确实写回
+                rollback_applied = bool(
+                    torch.equal(
+                        self.model.anchor_pool.index_select(0, old_idx),
+                        cf_vals
+                    )
+                )
+
+                # 真实性检查 2: 旧行相对 Phase2 后确实发生了变化
+                max_abs_change = (
+                    cf_vals - aa
+                ).abs().max().item()
+
+            print(f"[TIDR-AnchorCF-Check] mode={mode} "
+                  f"rollback_applied={rollback_applied} "
+                  f"max_abs_change={max_abs_change:.6f}")
+
+            # 保险: 写回失败立即中止，绝不允许"日志正常但实际没回滚"
+            assert rollback_applied, \
+                f"[TIDR-AnchorCF] rollback write-back failed (mode={mode})"
+
+            # ========================================================
+            # 反事实状态下重新评估 Task0
+            # ========================================================
+            acc_cf, stats_cf = (
+                self._diag_eval_task(
+                    0,
+                    collect_stats=True
+                )
+            )
+
+            if stats_cf:
+                self._print_diag_stats(
+                    f'TIDR-Diag-AnchorCF-{mode}',
+                    self.id,
+                    0,
+                    self._format_diag_stats(stats_cf)
+                )
+
+        finally:
+            # ========================================================
+            # 无论诊断是否成功，恢复完整 Phase2 后 anchor_pool
+            # ========================================================
+            with torch.no_grad():
+                self.model.anchor_pool.copy_(
+                    anchor_backup
+                )
+
+        # ============================================================
+        # 严格检查恢复是否成功
+        # ============================================================
+        restoration_pass = bool(
+            torch.equal(
+                self.model.anchor_pool.detach(),
+                anchor_backup
+            )
+        )
+
+        recovery = (
+            acc_cf - acc_normal
+            if not np.isnan(acc_cf)
+            else float('nan')
+        )
+
+        return (
+            acc_cf,
+            recovery,
+            restoration_pass,
+            max_abs_change
+        )
+
+    def _diag_joint_cf(self, acc_normal, key_before, anchor_before):
+        """
+        E6a-v2-Diag: Key + Anchor Joint Rollback 反事实实验。
+
+        同时恢复旧 Key 行和旧 Anchor 行到 Phase2 前，
+        检测 Key 与 Anchor 的非线性交互对剩余遗忘缺口的贡献
+        （Full AnchorCF 89.13 vs pre 96.74，剩余 ~7.6pp 的来源）。
+
+        Returns:
+            (acc_joint, recovery, key_restoration_pass, anchor_restoration_pass)
+        """
+        if (key_before is None or anchor_before is None
+                or len(self.old_seen_classes) == 0):
+            return float('nan'), float('nan'), False, False
+
+        old_idx = torch.tensor(
+            sorted(self.old_seen_classes),
+            dtype=torch.long,
+            device=self.device
+        )
+
+        key_backup = self.model.key.detach().clone()
+        anchor_backup = self.model.anchor_pool.detach().clone()
+
+        acc_joint = float('nan')
+        stats_j = None
+
+        try:
+            with torch.no_grad():
+                kb = (
+                    key_before
+                    .to(
+                        device=self.device,
+                        dtype=self.model.key.dtype
+                    )
+                    .index_select(0, old_idx)
+                )
+                ab = (
+                    anchor_before
+                    .to(
+                        device=self.device,
+                        dtype=self.model.anchor_pool.dtype
+                    )
+                    .index_select(0, old_idx)
+                )
+
+                self.model.key.index_copy_(0, old_idx, kb)
+                self.model.anchor_pool.index_copy_(0, old_idx, ab)
+
+                applied = bool(
+                    torch.equal(
+                        self.model.key.index_select(0, old_idx), kb
+                    )
+                    and torch.equal(
+                        self.model.anchor_pool.index_select(0, old_idx), ab
+                    )
+                )
+
+            print(f"[TIDR-JointCF-Check] rollback_applied={applied}")
+            assert applied, "[TIDR-JointCF] rollback write-back failed"
+
+            acc_joint, stats_j = self._diag_eval_task(
+                0,
+                collect_stats=True
+            )
+
+            if stats_j:
+                self._print_diag_stats(
+                    'TIDR-Diag-JointRollback',
+                    self.id,
+                    0,
+                    self._format_diag_stats(stats_j)
+                )
+
+        finally:
+            with torch.no_grad():
+                self.model.key.copy_(key_backup)
+                self.model.anchor_pool.copy_(anchor_backup)
+
+        key_pass = bool(
+            torch.equal(self.model.key.detach(), key_backup)
+        )
+        anchor_pass = bool(
+            torch.equal(self.model.anchor_pool.detach(), anchor_backup)
+        )
+
+        recovery = (
+            acc_joint - acc_normal
+            if not np.isnan(acc_joint)
+            else float('nan')
+        )
+
+        return (
+            acc_joint,
+            recovery,
+            key_pass,
+            anchor_pass
+        )
+
+    def _diag_eval_task(self, task, collect_stats=False,
+                        retrieval_allowed_mask=None):
         """
         E6a-v2-Diag: 只读、可恢复的确定性单任务评估。
 
@@ -1197,6 +2115,11 @@ class Client_DF:
         3. 恢复 RNG，避免诊断改变后续训练数据顺序和随机增强；
         4. DataLoader 使用 shuffle=False；
         5. 评估协议仍保持：vit(task_id=self.task_id, train=True) + heads[task]。
+
+        E6a-v3b-Diag: retrieval_allowed_mask（诊断专用，默认 None = 正常评估）
+        传入 bool [nb_classes] 掩码时，临时开启 use_seen_routing 并替换
+        seen_class_mask，使 hard/soft 检索只允许掩码内的 keys/anchors
+        （softmax 自然重归一化）。finally 中完整恢复原状态。
 
         Returns:
             (acc, stats); stats 仅在 collect_stats 且 task < self.task_id 时填充
@@ -1215,6 +2138,20 @@ class Client_DF:
         # 诊断不能改变后续训练随机轨迹
         rng_backup = get_rng_state()
 
+        # E6a-v3b-Diag r3: 固定诊断 seed（与 task 绑定）
+        # test_loader[task] 若继承训练集的随机 crop/flip transform，
+        # 三点 accuracy（post_task_switch_pre_phase1 / post_phase1 /
+        # post_phase2）与各 CF 会分别在不同增强实例上测量。RNG restore
+        # 只保证"诊断不影响训练"，不保证"不同时刻的诊断看到相同图片"。
+        # 用固定 seed 使同一 task 的每次诊断评估产生完全相同的增强序列；
+        # finally 中 set_rng_state 恢复真实训练 RNG。
+        _diag_seed = TIDR_DIAG_EVAL_SEED + int(task)
+        torch.manual_seed(_diag_seed)
+        np.random.seed(_diag_seed % (2 ** 32))
+        random.seed(_diag_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_diag_seed)
+
         # ============================================================
         # 2. 原位保存当前 head 参数（只保存 state_dict，不替换 head 对象）
         # ============================================================
@@ -1222,6 +2159,14 @@ class Client_DF:
             k: v.detach().clone()
             for k, v in self.model.head.state_dict().items()
         }
+
+        # E6a-v3b-Diag: Retrieval CF 掩码备份（None = 不干预检索）
+        retrieval_backup = None
+        if retrieval_allowed_mask is not None:
+            retrieval_backup = (
+                self.model.use_seen_routing,
+                self.model.seen_class_mask.detach().clone(),
+            )
 
         try:
             # --------------------------------------------------------
@@ -1236,6 +2181,20 @@ class Client_DF:
 
             # Tail Anchor 进入 eval
             self.model.eval()
+
+            # --------------------------------------------------------
+            # E6a-v3b-Diag: 应用检索掩码（Old-only / T0-only）
+            # 借用 use_seen_routing 机制: masked_fill(-inf) 限制
+            # hard route + soft attention 只在允许的 keys/anchors 上
+            # --------------------------------------------------------
+            if retrieval_allowed_mask is not None:
+                self.model.use_seen_routing = True
+                self.model.seen_class_mask.copy_(
+                    retrieval_allowed_mask.to(
+                        device=self.model.seen_class_mask.device,
+                        dtype=self.model.seen_class_mask.dtype
+                    )
+                )
 
             # --------------------------------------------------------
             # 临时加载被评估任务对应的 head
@@ -1404,6 +2363,13 @@ class Client_DF:
             # 4. 无论诊断成功还是异常，都必须恢复状态
             # ========================================================
 
+            # 恢复检索掩码（E6a-v3b-Diag: Retrieval CF）
+            if retrieval_backup is not None:
+                self.model.use_seen_routing = retrieval_backup[0]
+                self.model.seen_class_mask.copy_(
+                    retrieval_backup[1]
+                )
+
             # 原位恢复当前 head 参数
             self.model.head.load_state_dict(
                 head_backup
@@ -1431,15 +2397,62 @@ class Client_DF:
         # new-only 定义与 evaluate() TIDR-Diag 一致: 当前任务类 - 被评估任务类
         new_only_classes = [int(c) for c in self.class_mask[self.task_id]
                             if int(c) not in eval_class_set]
+
+        # ---- E6a-v3b-Diag: cross-task routing 分组 ----
+        # old_to_new_collision 只统计 T_eval → 当前任务，跨任务累积碰撞
+        # （如 T0 → T1）完全没算进去——R9 与 R10 的该指标不可直接比较。
+        # 因此新增: 每个其他已见任务 k 的 to_task{k}（collision + margin），
+        # 以及 to_any_non_eval（全部已见任务类 - 被评估任务类）。
+        # v3b-Diag r2: use_seen_routing=False 时 hard/soft 可访问全部
+        # nb_classes（含未来 Task3/4 尚未 seen 的 keys），T_eval → future
+        # 的碰撞未被上述任何组覆盖，故再增 future_unseen 组与
+        # all_non_eval（全部类别 - 被评估任务类）组。
+        per_task_classes = {}
+        all_seen_classes = set()
+        if task < self.task_id:
+            for k in range(0, self.task_id + 1):
+                for c in self.class_mask[k]:
+                    all_seen_classes.add(int(c))
+                if k == task:
+                    continue
+                cls_k = sorted(
+                    int(c) for c in self.class_mask[k]
+                    if int(c) not in eval_class_set
+                )
+                if cls_k:
+                    per_task_classes[k] = cls_k
+        any_non_eval_classes = sorted(all_seen_classes - eval_class_set)
+        all_classes = set(range(self.nb_classes))
+        future_unseen_classes = sorted(all_classes - all_seen_classes)
+        all_non_eval_classes = sorted(all_classes - eval_class_set)
+
         return {
             'eval_classes': eval_classes,
             'new_only_classes': new_only_classes,
             'total': 0,
             'wrong_total': 0,
-            # old-new（与 evaluate() TIDR-Diag 同定义）
+            # old-new（与 evaluate() TIDR-Diag 同定义；即 to_current_task）
             'old_to_new_collision': 0.0,
             'old_new_margin_sum': 0.0,
             'old_new_margin_negative': 0.0,
+            # E6a-v3b-Diag: cross-task routing
+            'per_task_classes': per_task_classes,
+            'any_non_eval_classes': any_non_eval_classes,
+            'per_task_collision': {k: 0.0 for k in per_task_classes},
+            'per_task_margin_sum': {k: 0.0 for k in per_task_classes},
+            'per_task_margin_negative': {k: 0.0 for k in per_task_classes},
+            'any_collision': 0.0,
+            'any_margin_sum': 0.0,
+            'any_margin_negative': 0.0,
+            # v3b-Diag r2: future-unseen / all-non-eval
+            'future_unseen_classes': future_unseen_classes,
+            'future_collision': 0.0,
+            'future_margin_sum': 0.0,
+            'future_margin_negative': 0.0,
+            'all_non_eval_classes': all_non_eval_classes,
+            'all_collision': 0.0,
+            'all_margin_sum': 0.0,
+            'all_margin_negative': 0.0,
             # old-old
             'old_old_top1_correct': 0.0,
             'old_old_margin_sum': 0.0,
@@ -1498,6 +2511,72 @@ class Client_DF:
             stats['old_new_margin_sum'] += on_margin.sum().item()
             stats['old_new_margin_negative'] += (on_margin < 0).float().sum().item()
 
+        # ---- E6a-v3b-Diag: cross-task routing ----
+        # T_eval → 每个其他已见任务 k 的 collision / margin
+        # + T_eval → any-non-eval（跨任务累积碰撞，old_to_new 不含的部分）
+        if stats.get('any_non_eval_classes'):
+            any_idx = torch.tensor(
+                stats['any_non_eval_classes'], dtype=torch.long,
+                device=similarity.device
+            )
+            stats['any_collision'] += torch.isin(
+                hard_idx, any_idx
+            ).float().sum().item()
+            max_any = similarity[:, any_idx].max(dim=1).values
+            any_margin = true_score - max_any
+            stats['any_margin_sum'] += any_margin.sum().item()
+            stats['any_margin_negative'] += (
+                any_margin < 0
+            ).float().sum().item()
+
+        for k, cls_k in (stats.get('per_task_classes') or {}).items():
+            idx_k = torch.tensor(
+                cls_k, dtype=torch.long, device=similarity.device
+            )
+            stats['per_task_collision'][k] += torch.isin(
+                hard_idx, idx_k
+            ).float().sum().item()
+            max_k = similarity[:, idx_k].max(dim=1).values
+            margin_k = true_score - max_k
+            stats['per_task_margin_sum'][k] += margin_k.sum().item()
+            stats['per_task_margin_negative'][k] += (
+                margin_k < 0
+            ).float().sum().item()
+
+        # ---- v3b-Diag r2: future-unseen / all-non-eval ----
+        # use_seen_routing=False 时检索可落到未来任务 keys 上；
+        # future 组单独拆出来，all 组 = 全部类别 - 被评估任务类
+        # （= any_non_eval（已见）+ future 的总和口径）。
+        if stats.get('future_unseen_classes'):
+            fut_idx = torch.tensor(
+                stats['future_unseen_classes'], dtype=torch.long,
+                device=similarity.device
+            )
+            stats['future_collision'] += torch.isin(
+                hard_idx, fut_idx
+            ).float().sum().item()
+            max_fut = similarity[:, fut_idx].max(dim=1).values
+            fut_margin = true_score - max_fut
+            stats['future_margin_sum'] += fut_margin.sum().item()
+            stats['future_margin_negative'] += (
+                fut_margin < 0
+            ).float().sum().item()
+
+        if stats.get('all_non_eval_classes'):
+            all_idx = torch.tensor(
+                stats['all_non_eval_classes'], dtype=torch.long,
+                device=similarity.device
+            )
+            stats['all_collision'] += torch.isin(
+                hard_idx, all_idx
+            ).float().sum().item()
+            max_all = similarity[:, all_idx].max(dim=1).values
+            all_margin = true_score - max_all
+            stats['all_margin_sum'] += all_margin.sum().item()
+            stats['all_margin_negative'] += (
+                all_margin < 0
+            ).float().sum().item()
+
         # ---- 样本级错误分解（关联分解，非因果分解） ----
         final_correct = (predicts == target)
         route_is_true = (hard_idx == target)
@@ -1527,7 +2606,10 @@ class Client_DF:
         """E6a-v2-Diag: 汇总统计累积器 → 标量指标（含两种比例形式）"""
         total = max(stats['total'], 1)
         wrong_total = max(stats['wrong_total'], 1)
-        return {
+        result = {
+            # E6a-v3b-Diag: old_to_new_collision 更名为 to_current_task_collision
+            # （明确其只统计 T_eval → 当前任务；旧键保留同值以兼容下游解析）
+            'to_current_task_collision': stats['old_to_new_collision'] / total,
             'old_to_new_collision': stats['old_to_new_collision'] / total,
             'mean_old_new_margin': stats['old_new_margin_sum'] / total,
             'negative_margin_rate': stats['old_new_margin_negative'] / total,
@@ -1543,11 +2625,71 @@ class Client_DF:
             'correct_and_non_true_route': stats['correct_and_non_true_route'] / total,
         }
 
+        # ---- E6a-v3b-Diag: cross-task routing 四组 ----
+        cross_fields = []
+        for k in sorted(stats.get('per_task_classes') or {}):
+            col_k = stats['per_task_collision'][k] / total
+            mgn_k = stats['per_task_margin_sum'][k] / total
+            neg_k = stats['per_task_margin_negative'][k] / total
+            result[f'to_task{k}_collision'] = col_k
+            result[f'mean_vs_task{k}_margin'] = mgn_k
+            result[f'neg_vs_task{k}_margin_rate'] = neg_k
+            cross_fields.append(
+                f"to_task{k}_collision={col_k:.4f} "
+                f"mean_vs_task{k}_margin={mgn_k:.4f} "
+                f"neg_vs_task{k}_margin_rate={neg_k:.4f}"
+            )
+        if stats.get('any_non_eval_classes'):
+            any_col = stats['any_collision'] / total
+            any_mgn = stats['any_margin_sum'] / total
+            any_neg = stats['any_margin_negative'] / total
+            result['to_any_non_eval_task_collision'] = any_col
+            result['mean_vs_any_non_eval_margin'] = any_mgn
+            result['neg_vs_any_non_eval_margin_rate'] = any_neg
+            cross_fields.append(
+                f"to_any_non_eval_task_collision={any_col:.4f} "
+                f"mean_vs_any_non_eval_margin={any_mgn:.4f} "
+                f"neg_vs_any_non_eval_margin_rate={any_neg:.4f}"
+            )
+        # v3b-Diag r2: future-unseen（use_seen_routing=False 时检索可
+        # 落到未来任务 keys）+ all-non-eval（全部类别 - 被评估任务类）
+        if stats.get('future_unseen_classes'):
+            fut_col = stats['future_collision'] / total
+            fut_mgn = stats['future_margin_sum'] / total
+            fut_neg = stats['future_margin_negative'] / total
+            result['to_future_unseen_collision'] = fut_col
+            result['mean_vs_future_unseen_margin'] = fut_mgn
+            result['neg_vs_future_unseen_margin_rate'] = fut_neg
+            cross_fields.append(
+                f"to_future_unseen_collision={fut_col:.4f} "
+                f"mean_vs_future_unseen_margin={fut_mgn:.4f} "
+                f"neg_vs_future_unseen_margin_rate={fut_neg:.4f}"
+            )
+        if stats.get('all_non_eval_classes'):
+            all_col = stats['all_collision'] / total
+            all_mgn = stats['all_margin_sum'] / total
+            all_neg = stats['all_margin_negative'] / total
+            result['to_any_non_eval_all_collision'] = all_col
+            result['mean_vs_any_non_eval_all_margin'] = all_mgn
+            result['neg_vs_any_non_eval_all_margin_rate'] = all_neg
+            cross_fields.append(
+                f"to_any_non_eval_all_collision={all_col:.4f} "
+                f"mean_vs_any_non_eval_all_margin={all_mgn:.4f} "
+                f"neg_vs_any_non_eval_all_margin_rate={all_neg:.4f}"
+            )
+        if cross_fields:
+            result['cross_task_fields'] = ' '.join(cross_fields)
+
+        return result
+
     @staticmethod
     def _print_diag_stats(tag, client_id, task, m):
         """E6a-v2-Diag: 打印完整诊断指标（括号内为占所有分类错误样本的比例）"""
+        cross_str = m.get('cross_task_fields', '')
+        if cross_str:
+            cross_str = ' ' + cross_str
         print(f"[{tag}] client={client_id} task={task} "
-              f"old_to_new_collision={m['old_to_new_collision']:.4f} "
+              f"to_current_task_collision={m['to_current_task_collision']:.4f} "
               f"mean_old_new_margin={m['mean_old_new_margin']:.4f} "
               f"negative_margin_rate={m['negative_margin_rate']:.4f} "
               f"old_old_top1_accuracy={m['old_old_top1_accuracy']:.4f} "
@@ -1559,17 +2701,76 @@ class Client_DF:
               f"({m['wrong_and_old_old_collision_of_wrong']:.4f}) "
               f"wrong_and_old_new_collision={m['wrong_and_old_new_collision']:.4f}"
               f"({m['wrong_and_old_new_collision_of_wrong']:.4f}) "
-              f"correct_and_non_true_route={m['correct_and_non_true_route']:.4f}")
+              f"correct_and_non_true_route={m['correct_and_non_true_route']:.4f}"
+              f"{cross_str}")
 
-    def _diag_capture_feature_samples(self, max_samples=256):
+    def _ensure_diag_fixed_inputs(self, max_samples=256):
         """
-        E6a-v2-Diag: 固定 Task0 测试样本
-        取 test_loader[0] Subset 的前 N 个索引（前后两次提取使用完全相同
-        的样本集合与顺序，避免 DataLoader shuffle 对齐问题）
+        E6a-v2-Diag / E6a-v3b-Diag: 固定 Task0 诊断样本（幂等，两步独立判断）
+
+        1) indices: 取 test_loader[0] Subset 的前 N 个索引（前后两次提取
+           使用完全相同的样本集合与顺序）。已存在则不覆盖——保持旧
+           checkpoint 恢复（extras 只带 indices）时的原样本集合。
+        2) 张量: 缓存这批样本的实际 input/target（CPU，一次性）。
+           只固定 indices 不够——若数据带随机增强（crop/flip），每次
+           重新取数会得到不同输入，feature/anchor_feat drift 会混入
+           augmentation noise。缓存张量后所有 pre/post 提取使用逐位
+           相同的输入。
+
+        P0 修复（v3b-Diag r2）:
+        - RNG 保护: 缓存过程会真正遍历 DataLoader，随机增强会消耗
+          torch/numpy/python RNG。必须 get_rng_state/set_rng_state 包裹，
+          否则诊断/task-checkpoint 会改变后续 Phase1 的 shuffle/增强
+          随机轨迹，"精确复现 v3a 轨迹"不成立（实验核心是因果对照，
+          诊断本身不能改变训练轨迹）。
+        - 独立判断: indices 已存在（旧 CP2/CP3 extras 恢复）但
+          fixed tensors 缺失时，必须用已有 indices 重新缓存张量。
+          不能因 indices 非空就整体跳过——否则固定张量机制对旧
+          checkpoint 永远不生效，fallback 重新取数会重新引入增强噪声。
         """
-        subset = self.test_loader[0]
-        indices = list(subset.indices)
-        self._diag_feature_samples = indices[:min(max_samples, len(indices))]
+        if self._diag_feature_samples is None:
+            subset = self.test_loader[0]
+            indices = list(subset.indices)
+            self._diag_feature_samples = indices[:min(max_samples, len(indices))]
+
+        if (self._diag_fixed_inputs is None
+                or self._diag_fixed_targets is None):
+            rng_backup = get_rng_state()
+            try:
+                # 缓存实际输入张量（CPU，一次性；增强实现固定在本次缓存）
+                sub = Subset(self.train_data[0], self._diag_feature_samples)
+                loader = DataLoader(sub, batch_size=16, shuffle=False)
+                inputs, targets = [], []
+                for x, y in loader:
+                    inputs.append(x)
+                    targets.append(y)
+                if inputs:
+                    self._diag_fixed_inputs = torch.cat(inputs, dim=0).cpu()
+                    self._diag_fixed_targets = torch.cat(targets, dim=0).cpu()
+            finally:
+                set_rng_state(rng_backup)
+
+    def _diag_fixed_input_batches(self, batch_size=8):
+        """
+        E6a-v3b-Diag: 固定诊断输入的 batch 迭代器
+        优先使用 _diag_fixed_inputs（缓存张量，无随机增强噪声）。
+        _ensure_diag_fixed_inputs 保证旧 checkpoint 恢复后也会补缓存
+        张量；fallback 按 indices 取数仅作安全网（缓存失败的极端情况）。
+        """
+        self._ensure_diag_fixed_inputs()
+
+        if self._diag_fixed_inputs is not None:
+            n = self._diag_fixed_inputs.size(0)
+            for s in range(0, n, batch_size):
+                yield (
+                    self._diag_fixed_inputs[s:s + batch_size],
+                    self._diag_fixed_targets[s:s + batch_size],
+                )
+        else:
+            sub = Subset(self.train_data[0], self._diag_feature_samples)
+            loader = DataLoader(sub, batch_size=batch_size, shuffle=False)
+            for x, y in loader:
+                yield x, y
 
     def _diag_extract_features(self):
         """
@@ -1599,11 +2800,8 @@ class Client_DF:
 
         try:
             # ========================================================
-            # 固定 Task0 样本
+            # 固定 Task0 样本（E6a-v3b-Diag: 使用缓存张量，无增强噪声）
             # ========================================================
-            sub = Subset(self.train_data[0], self._diag_feature_samples)
-            loader = DataLoader(sub, batch_size=8, shuffle=False)
-
             self.vit.to(self.device)
 
             if self.original_model is not None:
@@ -1613,7 +2811,7 @@ class Client_DF:
             feats = []
 
             with torch.no_grad():
-                for input, target in loader:
+                for input, _target in self._diag_fixed_input_batches():
                     input = input.to(self.device, non_blocking=True)
 
                     if self.original_model is not None:
@@ -1656,6 +2854,101 @@ class Client_DF:
 
             set_rng_state(rng_backup)
 
+    def _diag_extract_anchor_feat(self):
+        """
+        E6a-v3b-Diag: 提取固定 Task0 样本实际送入 head 的 retrieved anchor 表征
+        = Tail_Anchor forward 的 anchor_feat（hard + ratio*(soft-hard)），
+        即 head 输入 (x ⊕ anchor_feat) 的检索分量。
+
+        判断: raw Anchor 参数没坏 ≠ 送进 head 的检索表征没坏
+        （attention 分布变化会使 soft_anchor 混入新任务 Anchor）。
+
+        协议与 _diag_eval_task 完全一致:
+        - vit(task_id=self.task_id) 提取 feat（当前 task-stage prompt）
+        - model(feat, ...) 的第 4 个返回值 anchor_feat
+        - model.eval() 下 usage buffer 不累积
+        - 不加载 heads[task]（只用 anchor_feat，logits 被忽略）
+        - try/finally 恢复 train/eval 状态 + RNG
+        """
+        # 幂等: indices 已存在但 fixed tensors 缺失（旧 checkpoint 恢复）
+        # 时会用已有 indices 重新缓存张量（内部含 RNG 保护）
+        self._ensure_diag_fixed_inputs()
+
+        model_was_training = self.model.training
+        vit_was_training = self.vit.training
+
+        if self.original_model is not None:
+            original_model_was_training = self.original_model.training
+        else:
+            original_model_was_training = None
+
+        rng_backup = get_rng_state()
+
+        try:
+            # E6a-v3b-Diag: 使用缓存张量，无增强噪声
+            self.model.to(self.device)
+            self.vit.to(self.device)
+
+            if self.original_model is not None:
+                self.original_model.to(self.device)
+                self.original_model.eval()
+
+            # eval 模式: usage 不累积
+            self.model.eval()
+
+            proto_bank, proto_valid = self._build_semantic_proto_bank()
+            proto_calib_mask = self._build_proto_calib_mask(0)
+
+            feats = []
+
+            with torch.no_grad():
+                for input, target in self._diag_fixed_input_batches():
+                    input = input.to(self.device, non_blocking=True)
+                    target = target.to(self.device, non_blocking=True)
+
+                    if self.original_model is not None:
+                        output = self.original_model(input)
+                        cls_features = (
+                            output['pre_logits']
+                            .requires_grad_(False)
+                        )
+                    else:
+                        cls_features = None
+
+                    output = self.vit(
+                        input,
+                        task_id=self.task_id,
+                        cls_features=cls_features,
+                        train=True
+                    )
+                    feat = output['feat'].to(self.device)
+
+                    _, _, _, anchor_feat, _, _, _ = self.model(
+                        feat,
+                        target,
+                        proto_bank=proto_bank,
+                        proto_valid_mask=proto_valid,
+                        proto_calib_mask=proto_calib_mask
+                    )
+                    feats.append(anchor_feat.detach().cpu())
+
+            if len(feats) == 0:
+                return torch.empty(0, 768)
+
+            return torch.cat(feats, dim=0)
+
+        finally:
+            self.model.train(model_was_training)
+            self.vit.train(vit_was_training)
+
+            if (
+                self.original_model is not None
+                and original_model_was_training is not None
+            ):
+                self.original_model.train(original_model_was_training)
+
+            set_rng_state(rng_backup)
+
     def _diag_write_classwise_csv(self, stats_pre, stats_post):
         """
         E6a-v2-Diag: 类级诊断 CSV（只输出原始数据，不在代码里宣称因果）
@@ -1668,7 +2961,10 @@ class Client_DF:
             return
 
         os.makedirs('diagnostics', exist_ok=True)
-        path = os.path.join('diagnostics', 'E6a_v2_R5_C0_classwise.csv')
+        path = os.path.join(
+            'diagnostics',
+            f"E6a_v2_R{self.round}_C{self.id}_T{self.task_id}_classwise.csv"
+        )
 
         kb = F.normalize(self._diag_key_before_phase2.to(self.device), dim=1)
         ka = F.normalize(self._diag_key_after_phase2.to(self.device), dim=1)
@@ -1829,6 +3125,69 @@ class Client_DF:
                     device=self.device
                 )
 
+        # E6a-v3b-Diag: cross-task routing 分组
+        # old_to_new_collision 只统计 T_eval → 当前任务，R9（T1 阶段）与
+        # R10（T2 阶段）的该指标不可直接比较（统计对象变了）。
+        # 新增逐任务组 to_task{k}（k != task）+ any-non-eval 组，
+        # 用于研究 cross-task routing accumulation。
+        # v3b-Diag r2: use_seen_routing=False 时 hard/soft 可访问全部
+        # nb_classes（含未来任务尚未 seen 的 keys），故再增
+        # future-unseen 组与 any-non-eval-all（全部类别 - 被评估任务类）组。
+        do_cross_task_diag = (task < self.task_id)
+        cross_task_groups = {}
+        cross_collision = {}
+        cross_margin_sum = {}
+        cross_margin_negative = {}
+        any_non_eval_idx = None
+        any_collision = 0.0
+        any_margin_sum = 0.0
+        any_margin_negative = 0.0
+        future_unseen_idx = None
+        future_collision = 0.0
+        future_margin_sum = 0.0
+        future_margin_negative = 0.0
+        all_non_eval_idx = None
+        all_collision = 0.0
+        all_margin_sum = 0.0
+        all_margin_negative = 0.0
+        if do_cross_task_diag:
+            eval_classes_ct = set(int(c) for c in self.class_mask[task])
+            for k in range(0, self.task_id + 1):
+                if k == task:
+                    continue
+                cls_k = sorted(
+                    int(c) for c in self.class_mask[k]
+                    if int(c) not in eval_classes_ct
+                )
+                if cls_k:
+                    cross_task_groups[k] = torch.tensor(
+                        cls_k, dtype=torch.long, device=self.device
+                    )
+                    cross_collision[k] = 0.0
+                    cross_margin_sum[k] = 0.0
+                    cross_margin_negative[k] = 0.0
+            all_seen_ct = set()
+            for k in range(0, self.task_id + 1):
+                for c in self.class_mask[k]:
+                    all_seen_ct.add(int(c))
+            any_cls = sorted(all_seen_ct - eval_classes_ct)
+            if any_cls:
+                any_non_eval_idx = torch.tensor(
+                    any_cls, dtype=torch.long, device=self.device
+                )
+            # v3b-Diag r2: future-unseen / all-non-eval
+            all_cls_ct = set(range(self.nb_classes))
+            future_cls = sorted(all_cls_ct - all_seen_ct)
+            if future_cls:
+                future_unseen_idx = torch.tensor(
+                    future_cls, dtype=torch.long, device=self.device
+                )
+            all_noneval_cls = sorted(all_cls_ct - eval_classes_ct)
+            if all_noneval_cls:
+                all_non_eval_idx = torch.tensor(
+                    all_noneval_cls, dtype=torch.long, device=self.device
+                )
+
         # E6a-v2-Diag: Old-Old routing 诊断（--run_tidr_diagnostics 开启时）
         # old-old 类别集合 = 被评估任务自身类别（与 head 掩码一致）
         do_old_old_diag = (self.run_tidr_diagnostics and task < self.task_id)
@@ -1878,7 +3237,7 @@ class Client_DF:
                         self.model.soft_anchor = original_flag
 
                 # TIDR-Diag: 旧任务样本是否被新任务 Key 抢走
-                if do_invasion_diag or do_old_old_diag:
+                if do_invasion_diag or do_old_old_diag or do_cross_task_diag:
                     similarity = self.model.compute_similarity(feat)
                     diag_total += len(target)
 
@@ -1901,6 +3260,61 @@ class Client_DF:
                     old_new_margin_negative += (
                         margin < 0
                     ).float().sum().item()
+
+                # E6a-v3b-Diag: cross-task routing 累积
+                # （逐任务 to_task{k} + any-non-eval；correct_sim 与
+                #   do_invasion 的定义一致: cos(f, K_y)）
+                if do_cross_task_diag:
+                    true_score_ct = similarity.gather(
+                        1, target.unsqueeze(1)
+                    ).squeeze(1)
+                    for k, idx_k in cross_task_groups.items():
+                        cross_collision[k] += torch.isin(
+                            hard_idx, idx_k
+                        ).float().sum().item()
+                        max_k = similarity[:, idx_k].max(dim=1).values
+                        margin_k = true_score_ct - max_k
+                        cross_margin_sum[k] += margin_k.sum().item()
+                        cross_margin_negative[k] += (
+                            margin_k < 0
+                        ).float().sum().item()
+                    if any_non_eval_idx is not None:
+                        any_collision += torch.isin(
+                            hard_idx, any_non_eval_idx
+                        ).float().sum().item()
+                        max_any = similarity[
+                            :, any_non_eval_idx
+                        ].max(dim=1).values
+                        any_margin = true_score_ct - max_any
+                        any_margin_sum += any_margin.sum().item()
+                        any_margin_negative += (
+                            any_margin < 0
+                        ).float().sum().item()
+                    # v3b-Diag r2: future-unseen / all-non-eval
+                    if future_unseen_idx is not None:
+                        future_collision += torch.isin(
+                            hard_idx, future_unseen_idx
+                        ).float().sum().item()
+                        max_fut = similarity[
+                            :, future_unseen_idx
+                        ].max(dim=1).values
+                        fut_margin = true_score_ct - max_fut
+                        future_margin_sum += fut_margin.sum().item()
+                        future_margin_negative += (
+                            fut_margin < 0
+                        ).float().sum().item()
+                    if all_non_eval_idx is not None:
+                        all_collision += torch.isin(
+                            hard_idx, all_non_eval_idx
+                        ).float().sum().item()
+                        max_all = similarity[
+                            :, all_non_eval_idx
+                        ].max(dim=1).values
+                        all_margin = true_score_ct - max_all
+                        all_margin_sum += all_margin.sum().item()
+                        all_margin_negative += (
+                            all_margin < 0
+                        ).float().sum().item()
 
                 # E6a-v2-Diag: old-old margin
                 # true_score - max_{c∈被评估任务其他类} cos(f, K_c)
@@ -1955,22 +3369,63 @@ class Client_DF:
 
         if self.run_tidr_diagnostics and do_old_old_diag and diag_total > 0:
             # E6a-v2-Diag: 区分本地训练后 / 服务器聚合后，并附加 old-old 指标
-            # （old-new 三项指标沿用原 TIDR-Diag 定义；若当前任务类全部 ⊆
-            #   被评估任务类，old-new 指标输出 0）
+            # （E6a-v3b-Diag: old_to_new_collision 更名 to_current_task_collision
+            #   ——只统计 T_eval → 当前任务；跨任务碰撞看 to_task{k} /
+            #   to_any_non_eval_task_collision）
             scope = 'Global' if ('Aggregation' in phase or 'Global' in phase) else 'Local'
+            cross_parts = []
+            for k in sorted(cross_collision):
+                cross_parts.append(
+                    f"to_task{k}_collision="
+                    f"{cross_collision[k] / diag_total:.4f} "
+                    f"mean_vs_task{k}_margin="
+                    f"{cross_margin_sum[k] / diag_total:.4f} "
+                    f"neg_vs_task{k}_margin_rate="
+                    f"{cross_margin_negative[k] / diag_total:.4f}"
+                )
+            if any_non_eval_idx is not None:
+                cross_parts.append(
+                    f"to_any_non_eval_task_collision="
+                    f"{any_collision / diag_total:.4f} "
+                    f"mean_vs_any_non_eval_margin="
+                    f"{any_margin_sum / diag_total:.4f} "
+                    f"neg_vs_any_non_eval_margin_rate="
+                    f"{any_margin_negative / diag_total:.4f}"
+                )
+            # v3b-Diag r2: future-unseen / all-non-eval
+            if future_unseen_idx is not None:
+                cross_parts.append(
+                    f"to_future_unseen_collision="
+                    f"{future_collision / diag_total:.4f} "
+                    f"mean_vs_future_unseen_margin="
+                    f"{future_margin_sum / diag_total:.4f} "
+                    f"neg_vs_future_unseen_margin_rate="
+                    f"{future_margin_negative / diag_total:.4f}"
+                )
+            if all_non_eval_idx is not None:
+                cross_parts.append(
+                    f"to_any_non_eval_all_collision="
+                    f"{all_collision / diag_total:.4f} "
+                    f"mean_vs_any_non_eval_all_margin="
+                    f"{all_margin_sum / diag_total:.4f} "
+                    f"neg_vs_any_non_eval_all_margin_rate="
+                    f"{all_margin_negative / diag_total:.4f}"
+                )
+            cross_str = (' ' + ' '.join(cross_parts)) if cross_parts else ''
             print(f"[TIDR-{scope}Diag] Client {self.id}, Task {task}: "
-                  f"old_to_new_collision={old_to_new_collision / diag_total:.4f} "
+                  f"to_current_task_collision={old_to_new_collision / diag_total:.4f} "
                   f"mean_old_new_margin={old_new_margin_sum / diag_total:.4f} "
                   f"negative_margin_rate={old_new_margin_negative / diag_total:.4f} "
                   f"old_old_top1_accuracy={old_old_top1_correct / diag_total:.4f} "
                   f"mean_old_old_margin={old_old_margin_sum / diag_total:.4f} "
-                  f"negative_old_old_margin_rate={old_old_margin_negative / diag_total:.4f}")
+                  f"negative_old_old_margin_rate={old_old_margin_negative / diag_total:.4f}"
+                  f"{cross_str}")
         elif do_invasion_diag and diag_total > 0:
             old_to_new_rate = old_to_new_collision / diag_total
             mean_margin = old_new_margin_sum / diag_total
             neg_rate = old_new_margin_negative / diag_total
             print(f"[TIDR-Diag] Client {self.id}, Task {task}: "
-                  f"old_to_new_collision={old_to_new_rate:.4f} "
+                  f"to_current_task_collision={old_to_new_rate:.4f} "
                   f"mean_old_new_margin={mean_margin:.4f} "
                   f"negative_margin_rate={neg_rate:.4f}")
 

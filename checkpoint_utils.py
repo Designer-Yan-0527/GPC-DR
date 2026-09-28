@@ -40,7 +40,11 @@ CKPT_FORMAT = 'E6a-v2-Diag/1'
 CKPT_CP1 = 'R4_complete.pth'
 CKPT_CP2 = 'R5_C0_pre_phase2.pth'
 CKPT_CP3 = 'R5_C0_post_phase2.pth'
-CKPT_RESUME_POINTS = ('R4_complete', 'R5_C0_pre_phase2', 'R5_C0_post_phase2')
+CKPT_RESUME_POINTS = (
+    'R4_complete', 'R5_C0_pre_phase2', 'R5_C0_post_phase2',
+    # E6a-v3b-Diag: Task 边界 Checkpoint（--save_task_checkpoints）
+    'Task_C0_post_phase1', 'Task_C0_post_phase2',
+)
 
 
 class DiagStopException(Exception):

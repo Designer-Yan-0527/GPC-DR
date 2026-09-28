@@ -176,6 +176,8 @@ def get_args_parser(subparsers):
                             help='是否启用 Gradient-Decoupled Differentiable Retrieval')
     subparsers.add_argument('--use_task_isolated_diff', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='TIDR: only current-task keys receive CE gradient through differentiable retrieval')
+    subparsers.add_argument('--anchor_no_wd', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='E6a-v3a-Diag: Phase2 optimizer 中 anchor_pool 免 weight decay（诊断旧 Anchor 范数坍缩是否由 weight decay 驱动）')
     subparsers.add_argument('--adaptive_gamma', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用置信度门控的自适应 γ')
     subparsers.add_argument('--gamma_max', default=0.35, type=float,
@@ -201,3 +203,11 @@ def get_args_parser(subparsers):
                             help='开启 TIDR 遗忘机制诊断（Round5/Client0/Task1: '
                                  'PhaseDiag / KeyCF Rollback / Old-Old / FeatureDrift / '
                                  'StepDiag / Classwise CSV）')
+    subparsers.add_argument('--diag_cf_round', default=5, type=int,
+                            help='E6a-v3b-Diag: 完整反事实套件（KeyCF/AnchorCF/NormCF/DirCF/JointCF/'
+                                 'RetrievalCF + CP2/CP3 保存）生效的轮次（默认 5 = Round5/Task1；'
+                                 'Task2 诊断传 10）。其他任务首轮仅输出轻量 PhaseDiag 三点准确率')
+    subparsers.add_argument('--save_task_checkpoints', action='store_true',
+                            help='E6a-v3b-Diag: 每个 Task 边界保存 Checkpoint（Task{k}_start.pth / '
+                                 'Task{k}_C0_post_phase1.pth / Task{k}_C0_post_phase2.pth / '
+                                 'Task{k}_complete.pth，k>=1）')

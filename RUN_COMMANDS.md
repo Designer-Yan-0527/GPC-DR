@@ -182,61 +182,71 @@ python main.py cifar100_delay \
 
 - 所有新增参数默认关闭；不开启时 E3 / E6a / E6a-v2 行为完全不变。
 - CP1 只依赖 `--save_checkpoints`；CP2 / CP3 的保存与全部诊断依赖 `--run_tidr_diagnostics`。
-- 诊断目标位置固定为 **Round5 / Client0 / Task1**（要求 `--global_epoch=5`，与现有实验一致）。
+- 诊断目标默认为 **Round5 / Client0 / Task1**（要求 `--global_epoch=5`，与现有实验一致）；
+  E6a-v3b-Diag 起可通过 `--diag_cf_round` 指定其他 CF 轮（如 Task2 传 10）。
 - Checkpoint 保存至 `checkpoints/E6a_v2_diag/{dataset}_seed{seed}_{timestamp}/`，
   每次运行独立目录，不覆盖其他实验（**恢复运行也会新建目录**，CP3 保存在恢复运行的新目录中）。
 - 恢复运行必须使用与原运行**完全相同的超参数**（数据 split 依赖相同 seed）。
 
 #### 方案 A：单次完整诊断运行（最简单，一条命令无人值守）
 
-一次跑完整个训练（Round0-5），保存 CP1/CP2/CP3 并输出全部诊断日志。
-**日常使用直接复制这条即可：**
+一次跑完整个训练（Round0-5），保存 CP1/CP2/CP3 并输出全部诊断。
 
-```powershell
+```bash
+python main.py cifar100_delay --batch-size 16 --data-path ./local_datasets/ \
+  --data_name cifar100 --output_dir ./output/cifar100_e6a_v2_diag \
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25 \
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05 \
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2 \
+  --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5 \
+  --use_diff_retrieval=True --use_task_isolated_diff=True \
+  --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False \
+  --use_proto_calibration=False --use_gpa=False \
+  --run_tidr_diagnostics --save_checkpoints
 ```
 
-#### 方案 B：分步链式运行（PowerShell 整段复制，自动接力、无人值守）
+#### 方案 B：分步链式运行（bash 整段复制，自动接力、无人值守）
 
 依次执行：跑到 CP2 停止 → 从 CP2 恢复进入 Phase2 并跑到训练结束 → 从 CP3 离线诊断。
 自动定位每次运行生成的 checkpoint 目录，任一步失败立即中止。
 
-```powershell
-# ===== E6a-v2-Diag 无人值守链式运行（PowerShell，整段复制执行） =====
+```bash
+# ===== E6a-v2-Diag 无人值守链式运行（bash，整段复制执行） =====
 # 公共超参（E6a-v2 完整超参，与方案 A 完全一致）
-$common = @(
-  'main.py','cifar100_delay',
-  '--batch-size','16','--data-path','./local_datasets/','--data_name','cifar100',
-  '--output_dir','./output/cifar100_e6a_v2_diag',
-  '--use_soft_anchor=True','--soft_temperature=0.17','--soft_anchor_ratio=0.25',
-  '--use_route_loss=True','--route_temperature=0.1','--lambda_route=0.05',
-  '--use_msp=True','--msp_diversity_coeff=0.03','--diversity_margin=0.2',
-  '--msp_temporal_coeff=0.1','--key_temporal_ratio=0.5',
-  '--use_diff_retrieval=True','--use_task_isolated_diff=True',
-  '--adaptive_gamma=False','--use_proto_replay=False','--use_seen_routing=False',
-  '--use_proto_calibration=False','--use_gpa=False'
+common=(
+  main.py cifar100_delay
+  --batch-size 16 --data-path ./local_datasets/ --data_name cifar100
+  --output_dir ./output/cifar100_e6a_v2_diag
+  --use_soft_anchor=True --soft_temperature=0.17 --soft_anchor_ratio=0.25
+  --use_route_loss=True --route_temperature=0.1 --lambda_route=0.05
+  --use_msp=True --msp_diversity_coeff=0.03 --diversity_margin=0.2
+  --msp_temporal_coeff=0.1 --key_temporal_ratio=0.5
+  --use_diff_retrieval=True --use_task_isolated_diff=True
+  --adaptive_gamma=False --use_proto_replay=False --use_seen_routing=False
+  --use_proto_calibration=False --use_gpa=False
 )
 
 # Step 1: 跑到 CP2（Round5 Client0 Phase2 开始前）保存并停止
-python $common --run_tidr_diagnostics --save_checkpoints --stop_at_checkpoint R5_C0_pre_phase2
-if ($LASTEXITCODE -ne 0) { throw "Step 1 failed (stop at CP2)" }
+python "${common[@]}" --run_tidr_diagnostics --save_checkpoints --stop_at_checkpoint R5_C0_pre_phase2 \
+  || { echo "Step 1 failed (stop at CP2)" >&2; exit 1; }
 
 # Step 2: 定位 Step 1 生成的 run 目录，从 CP2 恢复直接进入 Phase2，跑到训练结束（CP3 存到新目录）
-$runDir1 = Get-ChildItem ./checkpoints/E6a_v2_diag -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
-python $common --run_tidr_diagnostics --save_checkpoints --resume_checkpoint "$($runDir1.FullName)/R5_C0_pre_phase2.pth"
-if ($LASTEXITCODE -ne 0) { throw "Step 2 failed (resume from CP2)" }
+runDir1=$(ls -td ./checkpoints/E6a_v2_diag/*/ | head -n 1)
+python "${common[@]}" --run_tidr_diagnostics --save_checkpoints --resume_checkpoint "${runDir1}R5_C0_pre_phase2.pth" \
+  || { echo "Step 2 failed (resume from CP2)" >&2; exit 1; }
 
 # Step 3: 定位 Step 2 生成的新 run 目录，从 CP3 做离线诊断（不训练，应复现保存时准确率）
-$runDir2 = Get-ChildItem ./checkpoints/E6a_v2_diag -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
-python $common --run_tidr_diagnostics --resume_checkpoint "$($runDir2.FullName)/R5_C0_post_phase2.pth"
-if ($LASTEXITCODE -ne 0) { throw "Step 3 failed (CP3 offline diag)" }
+runDir2=$(ls -td ./checkpoints/E6a_v2_diag/*/ | head -n 1)
+python "${common[@]}" --run_tidr_diagnostics --resume_checkpoint "${runDir2}R5_C0_post_phase2.pth" \
+  || { echo "Step 3 failed (CP3 offline diag)" >&2; exit 1; }
 
-Write-Host "E6a-v2-Diag chain finished. Checkpoints: $runDir1 , $runDir2"
+echo "E6a-v2-Diag chain finished. Checkpoints: ${runDir1} , ${runDir2}"
 ```
 
 #### 单步命令（手动分步调试用，替换 <run_dir> 为实际目录名）
 
-```powershell
-# 公共超参前缀（与方案 B 中 $common 相同的单行展开）
+```bash
+# 公共超参前缀（与方案 B 中 common 数组相同的单行展开）
 
 # 1) 完整诊断运行（同方案 A）
 #    末尾加: --run_tidr_diagnostics --save_checkpoints
@@ -263,7 +273,141 @@ Write-Host "E6a-v2-Diag chain finished. Checkpoints: $runDir1 , $runDir2"
 - `[TIDR-KeyCF]` acc_normal / acc_rollback / recovery / key_restoration_pass
 - `[TIDR-LocalDiag]` / `[TIDR-GlobalDiag]` evaluate() 中的 old-new + old-old 指标（本地/聚合后）
 - `[TIDR-KeyDiag]` 追加 median / p95（仅诊断开启时）
-- 类级 CSV：`diagnostics/E6a_v2_R5_C0_classwise.csv`
+- 类级 CSV：`diagnostics/E6a_v2_R{round}_C{client}_T{task}_classwise.csv`
+
+### E6a-v3b-Diag. Task2 崩溃定位（跨任务诊断扩展）
+
+背景：E6a-v3a（No-Anchor-WD）解决 Task1 阶段 Anchor 范数塌缩后，Round10 / Task2 首轮
+Client0 Task0 从 88.86% 崩到 39.40%（Key drift 小、old-old routing 高，形态不同于 Task1）。
+本轮**只做诊断，不加任何修复**。
+
+新增参数（均默认关闭）：
+
+- `--diag_cf_round`（默认 5）：完整反事实套件（KeyCF/AnchorCF/NormCF/DirCF/JointCF/
+  RetrievalCF + CP2/CP3 保存）生效的轮次。**Task2 诊断传 10**。
+- `--save_task_checkpoints`：每个 Task 边界保存 Checkpoint（k≥1）：
+  `Task{k}_start.pth` / `Task{k}_C0_post_phase1.pth` / `Task{k}_C0_post_phase2.pth` /
+  `Task{k}_complete.pth`（独立于 `--run_tidr_diagnostics`，可与任何实验组合）。
+
+诊断分级：
+
+- **CF 轮**（`i == diag_cf_round`，需 `--run_tidr_diagnostics --save_checkpoints`）：
+  完整诊断（PhaseDiag 三点 + drift + 全部 CF + CP2/CP3）。
+- **其他任务首轮**（Round5/10/15/20，仅 `--run_tidr_diagnostics`）：
+  轻量 PhaseDiag——Task0..k 的 `post_task_switch_pre_phase1 / post_phase1 /
+  post_phase2` 三点准确率 +
+  P1/P2 两窗口 drift + RetrievalCF。**这是定位 Task0 崩在 Phase1 还是 Phase2 的关键**。
+
+恢复点新增：
+
+- `Task_C0_post_phase1` → **mid-round resume**：Phase1 已完成，恢复后跳过
+  Phase1 直接继续 Phase2（与 CP2 同协议；不依赖 `--run_tidr_diagnostics`，
+  仅 `--save_task_checkpoints` 也能独立恢复）
+- `Task_C0_post_phase2` → **standalone/offline 离线诊断**。注意：仅开
+  `--save_task_checkpoints`（诊断关闭）时保存的轻量版 extras 不含 P1 三点
+  准确率与 P1 snapshot，离线只能复跑 KeyCF/AnchorCF 等 Phase2 后 CF；
+  "完整复现 P1Drift/RetrievedAnchorDrift" 需与 `--run_tidr_diagnostics`
+  联合运行保存的版本
+- `Task_start` / `Task_complete`（从 Task 边界继续训练）
+
+CP1/CP2/CP3 文件名跟随
+`diag_cf_round`（如 Round10 → `R9_complete.pth` / `R10_C0_pre_phase2.pth` /
+`R10_C0_post_phase2.pth`；默认 Round5 时名称与旧版一致）。
+
+#### 推荐：从原运行 CP2 恢复，复现 v3a 轨迹 + Task2 诊断（免重跑 Round0-4）
+
+从 E6a-v3a 链式运行的 Step 1 目录（保存了 `R5_C0_pre_phase2.pth`）恢复，加上
+`--anchor_no_wd=True` 即可精确复现 v3a 的 Round5-24 轨迹，同时拿到 Task2 诊断：
+
+```bash
+# common 同方案 B，另需加入: '--anchor_no_wd=True'
+diagDir='checkpoints/E6a_v2_diag/<v3a_step1_run_dir>'   # 含 R5_C0_pre_phase2.pth 的目录
+python "${common[@]}" --anchor_no_wd=True \
+  --run_tidr_diagnostics --save_checkpoints --save_task_checkpoints \
+  --diag_cf_round 10 \
+  --resume_checkpoint "${diagDir}/R5_C0_pre_phase2.pth"
+```
+
+说明：
+
+- Round5 起点恢复会自动视为 CF 轮（复现 v3a 的 Round5 诊断，可作 sanity check），
+  Round10 仍是完整 CF 轮；Round15/20 为轻量 PhaseDiag。
+- Round5 为 mid-round 恢复：`Task1_start.pth` 与 `Task1_C0_post_phase1.pth` 均
+  不保存（Phase2-start 钩子被跳过，语义正确——`R5_C0_pre_phase2.pth` 本身即
+  Task1 post-Phase1 等价 checkpoint）；`Task1_C0_post_phase2.pth` 与
+  `Task1_complete.pth` 正常保存。
+- 验收重点：Round10 日志中 `[TIDR-PhaseDiag]` 的
+  `task0_acc_post_task_switch_pre_phase1 / task0_acc_post_phase1 / task0_acc_post_phase2`
+  三个数——先确认 88.86 → 39.40 崩在 task-switch 边界、Phase1 还是 Phase2
+  （注意 pre-Phase1 点位于 task switch 之后、vit 已用新任务 stage，若 88.86→pre-P1
+  已大跌则崩在 Task1→Task2 边界本身，与 Phase1 优化无关），再按
+  KeyCF/AnchorCF/NormCF/DirCF/JointCF/RetrievalCF 的 recovery 决定 v3b 方向。
+
+#### 备选：全量重跑（从头，Round0-24）
+
+```bash
+python "${common[@]}" --anchor_no_wd=True \
+  --run_tidr_diagnostics --save_checkpoints --save_task_checkpoints \
+  --diag_cf_round 10
+```
+
+（Round5 为轻量 PhaseDiag、Round10 为完整 CF；Task1 的 CF 结论已有，无需重复。）
+
+#### 离线反事实复跑（如需，从本运行保存的 Task2 checkpoint）
+
+```bash
+runDir=$(ls -td ./checkpoints/E6a_v2_diag/*/ | head -n 1)
+# Task2 C0 Phase2 后离线诊断（复跑 CF 套件）
+python "${common[@]}" --anchor_no_wd=True --run_tidr_diagnostics \
+  --resume_checkpoint "${runDir}Task2_C0_post_phase2.pth"
+```
+
+新增日志：
+
+- `[TIDR-TaskBoundaryDiag]`（任务首轮、update_data 之前，Server 端 Client0）
+  `task{t}_acc_pre_task_switch`（全部旧任务 t=0..k-1）——Task{k-1} stage、
+  上轮结束后的同协议基准。A(pre-switch) → B(post-switch/pre-P1) = task switch
+  本身的因果贡献；B → C = Phase1；C → D = Phase2。若 T0 大跌而 T1 几乎
+  不掉，支持 oldest-task-specific transition failure。注意普通 evaluate()
+  的 R9 日志值（shuffle=True、无固定 seed）与 A 不可做精确差值，A 才是
+  同协议基准
+- `[TIDR-PhaseDiag]`（所有 task_id>0 首轮）task{k} 三点准确率
+  post_task_switch_pre_phase1 / post_phase1(=pre_phase2) / post_phase2 +
+  p1/p2/total change（注意 pre-Phase1 点位于 task switch 之后、vit 已用
+  新任务 stage；若上轮末尾→pre-P1 已大跌，说明崩在任务边界本身而非 Phase1）
+- `[TIDR-P1Drift]` Phase1 窗口漂移（key/anchor/head 预期 0；feature 与
+  retrieved anchor_feat 是核心——判断 ViT/Prompt 表示漂移）。
+  drift 全部使用缓存的固定输入张量（非仅固定 indices），无随机增强噪声；
+  固定张量的缓存过程有 RNG save/restore 保护，不改变训练随机轨迹
+  （旧 checkpoint 恢复时 indices 已存在但张量缺失会自动补缓存）
+- `[TIDR-RetrievedAnchorDrift]` Phase2 窗口 retrieved anchor feature 的
+  cos drift / norm ratio / L2 drift（raw Anchor 参数没坏但送进旧 head 的
+  retrieval representation 可能已变）
+- `[TIDR-HeadDriftDiag]` current_train_head_change（当前任务 head 正常训练
+  幅度，不能解释 Task0 遗忘）/ task0_snapshot_head_change（应严格为 0，
+  非 0 = 快照被篡改的 bug 信号）/ all_old_snapshot_heads_max_change
+- `[TIDR-RetrievalCF]` 四组掩码（评 Task0，softmax 自然重归一化）:
+  acc_seen_only（只允许 T0..T{cur}，recovery = future unseen 污染）/
+  acc_exclude_current（全部类别但屏蔽当前任务类，recovery = 当前任务单独污染）/
+  acc_prev_seen_only（只允许 union(class_mask[0..task_id-1])，recovery =
+  当前任务 + future 联合污染）/
+  acc_t0_only（只允许 Task0 anchors）——分解新任务 keys/anchors 与
+  future unseen keys 的 retrieval contamination
+- `[TIDR-AnchorRouteDiag]` cur_task_to_any_old_anchor_rate（当前任务样本
+  hard route 到旧类 Anchor 的比例）
+- **routing 指标更名/扩展**（`[TIDR-LocalDiag]`/`[TIDR-GlobalDiag]`/
+  `[TIDR-Diag-Normal]` 等）：`old_to_new_collision` 更名为
+  `to_current_task_collision`（只统计 T_eval→当前任务，**R9 与 R10 的该值
+  不可直接比较**）；新增 `to_task{k}_collision` / `mean_vs_task{k}_margin` /
+  `neg_vs_task{k}_margin_rate`（逐任务）、
+  `to_any_non_eval_task_collision` / `mean_vs_any_non_eval_margin` /
+  `neg_vs_any_non_eval_margin_rate`（全部已见任务类 - 被评估任务类）、
+  `to_future_unseen_collision` / `mean_vs_future_unseen_margin` /
+  `neg_vs_future_unseen_margin_rate`（未来任务未 seen 类——
+  use_seen_routing=False 时检索可落到 future keys，这组单独拆出）与
+  `to_any_non_eval_all_collision` / `mean_vs_any_non_eval_all_margin` /
+  `neg_vs_any_non_eval_all_margin_rate`（全部类别 - 被评估任务类 =
+  已见非评估 + future 的总和口径），用于研究 cross-task routing accumulation
 
 ### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
 
