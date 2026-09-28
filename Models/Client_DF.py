@@ -21,6 +21,7 @@ FedSMR 框架客户端模块
 """
 
 import csv
+import hashlib
 import os
 import random
 from copy import deepcopy
@@ -127,6 +128,13 @@ class Client_DF:
         self.use_task_isolated_diff = getattr(args, 'use_task_isolated_diff', False)
         self.use_gpa = getattr(args, 'use_gpa', False)
         self.anchor_no_wd = getattr(args, 'anchor_no_wd', False)
+        # E6a-v3b B-实验（最小因果干预，默认关闭 = B0 原样）:
+        #   p2_seen_only:     B1/B3 — Phase2 训练期 Seen-only retrieval
+        #                     （候选空间限制为 T0..T_cur，屏蔽 future keys）
+        #   p2_freeze_old_key: B2/B3 — Phase2 训练期 old-Key freeze
+        #                     （每步 optimizer.step() 后恢复旧 Key 行快照）
+        self.p2_seen_only = getattr(args, 'p2_seen_only', False)
+        self.p2_freeze_old_key = getattr(args, 'p2_freeze_old_key', False)
         self.lambda_gpa = getattr(args, 'lambda_gpa', 0.2)
         self.lambda_pcr = getattr(args, 'lambda_pcr', 0.05)
         # -------------------------------------------------------------------
@@ -502,9 +510,18 @@ class Client_DF:
             # 重算 pre-P2 baseline，保证 pre/post 严格可比。
             # 注意: 旧 CP2 未保存 pre-Phase1 fixed snapshots，Round5 的
             # P1Drift 无法凭空恢复（不影响 Round10 Task2 诊断）。
+            # v3b-Diag r5: 重建条件扩展 —— 旧 checkpoint（r4 及更早代码
+            # 保存，fixed tensors 已存在）的 phase_stats_pre 缺少
+            # soft-mass 累积器，SoftMassDiag 会缺 post_p1 基线；B-实验
+            # 从 R10_C0_pre_phase2.pth 恢复时必须同协议重建 stats。
+            _stats_pre_missing_soft = (
+                not isinstance(self._diag_phase_stats_pre, dict)
+                or 'soft_mass_eval_sum' not in self._diag_phase_stats_pre
+            )
             if (self._diag_feature_samples is not None
                     and (self._diag_fixed_inputs is None
-                         or self._diag_fixed_targets is None)):
+                         or self._diag_fixed_targets is None
+                         or _stats_pre_missing_soft)):
                 self._ensure_diag_fixed_inputs()
                 self._diag_feature_before = self._diag_extract_features()
                 self._diag_anchor_feat_before_phase2 = (
@@ -760,6 +777,59 @@ class Client_DF:
             # 仅 Task Checkpoint（诊断关闭）: 只保存，不做评估
             self._task_ckpt_phase2_start(round, args, global_step, total_steps)
 
+        # =============================================================
+        # E6a-v3b B-实验: Phase2 最小因果干预（默认全部关闭 = B0 原样）
+        # 位于 phase2_start 钩子之后 → pre-P2 诊断基线在 Normal 协议下
+        # 采集；训练循环结束、返回之前恢复 → phase2_end 诊断（post-P2
+        # PhaseDiag / SoftMassDiag / 各 CF）同样在 Normal 协议下评估。
+        # =============================================================
+        # B1/B3: Seen-only retrieval —— Phase2 训练期 hard route 与
+        # soft attention 只允许 T0..T_cur 的 keys/anchors（屏蔽 future
+        # unseen keys 的候选竞争）。route loss / MSP 不受影响（它们直接
+        # 用 compute_similarity / 参数本身，不走 _get_routing_similarity）。
+        b1_backup = None
+        if self.p2_seen_only:
+            b1_backup = (
+                self.model.use_seen_routing,
+                self.model.seen_class_mask.detach().clone(),
+            )
+            seen_union = sorted(set().union(*[
+                set(int(c) for c in self.class_mask[k])
+                for k in range(0, self.task_id + 1)
+            ]))
+            b1_mask = torch.zeros(self.nb_classes, dtype=torch.bool)
+            b1_mask[torch.tensor(seen_union, dtype=torch.long)] = True
+            self.model.use_seen_routing = True
+            self.model.seen_class_mask.copy_(
+                b1_mask.to(
+                    device=self.model.seen_class_mask.device,
+                    dtype=self.model.seen_class_mask.dtype
+                )
+            )
+            print(f"[E6a-v3b-B1] Phase2 Seen-only retrieval: "
+                  f"client={self.id} task={self.task_id} "
+                  f"allowed={len(seen_union)}/{self.nb_classes} classes")
+
+        # B2/B3: old-Key freeze —— 真正的冻结（不是仅梯度置零）:
+        # 每步 optimizer.step() 之后用 index_copy_ 恢复旧 Key 行快照，
+        # 连 weight decay / temporal / route loss 的任何更新一并消除。
+        b2_old_idx = None
+        b2_key_snapshot = None
+        if (self.p2_freeze_old_key
+                and self.task_id >= 1
+                and len(self.old_seen_classes) > 0):
+            b2_old_idx = torch.tensor(
+                sorted(self.old_seen_classes), dtype=torch.long,
+                device=self.model.key.device
+            )
+            b2_key_snapshot = (
+                self.model.key.data[b2_old_idx].detach().clone()
+            )
+            print(f"[E6a-v3b-B2] Phase2 old-Key freeze: "
+                  f"client={self.id} task={self.task_id} "
+                  f"n_old_keys={b2_old_idx.numel()} "
+                  f"(post-step index_copy_ restore)")
+
         # E6a-v2-Diag: 优化步数统计（StepDiag，默认关闭时零开销）
         diag_steps_active = self._tidr_diag_config is not None
         diag_num_batches = 0
@@ -887,6 +957,14 @@ class Client_DF:
                 loss.backward()
                 optimizer.step()
 
+                # B2/B3: old-Key freeze（post-step 恢复快照，消除包括
+                # weight decay 在内的全部旧 Key 更新）
+                if b2_key_snapshot is not None:
+                    with torch.no_grad():
+                        self.model.key.data.index_copy_(
+                            0, b2_old_idx, b2_key_snapshot
+                        )
+
                 global_step += 1
 
         # E6a-v2-Diag: StepDiag 统计（仅诊断开启时）
@@ -921,6 +999,25 @@ class Client_DF:
             else:
                 print(f"[E1-Diag] client={self.id} task={self.task_id} "
                       f"entropy={entropy:.4f} max_w={max_weight:.4f}")
+
+        # =============================================================
+        # E6a-v3b B-实验: 干预状态恢复（phase2_end 诊断在 Normal 协议下运行）
+        # B1: 恢复 use_seen_routing / seen_class_mask 原值
+        # B2: 自检 —— 训练结束后旧 Key 行应与快照逐位一致
+        # =============================================================
+        if b1_backup is not None:
+            self.model.use_seen_routing = b1_backup[0]
+            self.model.seen_class_mask.copy_(b1_backup[1])
+            print(f"[E6a-v3b-B1] Seen-only retrieval disabled after "
+                  f"Phase2 (routing config restored)")
+
+        if b2_key_snapshot is not None:
+            with torch.no_grad():
+                b2_pass = torch.equal(
+                    self.model.key.data[b2_old_idx], b2_key_snapshot
+                )
+            print(f"[E6a-v3b-B2] old-Key freeze check: "
+                  f"old_key_bitwise_preserved={b2_pass}")
 
         return task_hard_usage
 
@@ -1400,6 +1497,66 @@ class Client_DF:
                   f"task{t}_acc_total_change={a_post - a_p1:+.2f}")
 
         acc0_post = post_accs['task0']
+
+        # ---- 1b) SoftMassDiag: Task0 评估的 group-wise soft attention mass ----
+        # 决定性诊断（E6a-v3b Failure Mode II）: Phase2 期间 query feature /
+        # raw Anchor 均未变，但 retrieved anchor 巨幅漂移 → 谁拿走了 soft
+        # retrieval mass？分组: 被评估任务 / 各已见任务（含当前任务）/
+        # future unseen / true key。post_p1 即 pre_phase2 点
+        # （_diag_phase_stats_pre，Phase1 结束钩子采集）。
+        # 同时输出 hard route 各组（to_eval/to_task{k}/to_future）的
+        # post_p1 vs post_p2 —— hard 字段在旧 checkpoint extras 的 pre
+        # stats（r2+ 版本）中已存在，可与 soft 字段一并对照。
+        # 旧 extras 无 soft-mass 累积器时 soft 字段只打印 post_p2
+        # （不打印假的 0 基线）。
+        if stats0_post is not None:
+            m_sm_post = self._format_diag_stats(stats0_post)
+            stats_pre = self._diag_phase_stats_pre
+            m_sm_pre = (
+                self._format_diag_stats(stats_pre) if stats_pre else None
+            )
+            has_pre_soft = (
+                m_sm_pre is not None
+                and stats_pre is not None
+                and 'soft_mass_eval_sum' in stats_pre
+            )
+            sm_groups = (
+                ['soft_mass_to_eval_task', 'soft_mass_to_true_key']
+                + [f'soft_mass_to_task{k}'
+                   for k in sorted(stats0_post.get('per_task_classes') or {})]
+                + (['soft_mass_to_future_unseen']
+                   if stats0_post.get('future_unseen_classes') else [])
+                + ['mean_soft_attn_entropy', 'mean_soft_attn_max_w']
+                # hard route 各组（与 soft 同表对照）
+                + ['to_eval_task_collision']
+                + [f'to_task{k}_collision'
+                   for k in sorted(stats0_post.get('per_task_classes') or {})]
+                + (['to_future_unseen_collision']
+                   if stats0_post.get('future_unseen_classes') else [])
+            )
+            sm_parts = []
+            for sm_key in sm_groups:
+                v_post = m_sm_post.get(sm_key)
+                if v_post is None:
+                    continue
+                # soft 字段的 pre 值需要 r5 累积器存在；hard 字段旧版已有
+                can_print_pre = (
+                    m_sm_pre is not None
+                    and m_sm_pre.get(sm_key) is not None
+                    and (not sm_key.startswith('soft_') or has_pre_soft)
+                )
+                if can_print_pre:
+                    sm_parts.append(
+                        f"{sm_key}_post_p1={m_sm_pre[sm_key]:.4f} "
+                        f"{sm_key}_post_p2={v_post:.4f} "
+                        f"{sm_key}_p2_change={v_post - m_sm_pre[sm_key]:+.4f}"
+                    )
+                else:
+                    sm_parts.append(f"{sm_key}_post_p2={v_post:.4f}")
+            if sm_parts:
+                print(f"[TIDR-SoftMassDiag] client={self.id} "
+                      f"task={self.task_id} eval_task=0 "
+                      + ' '.join(sm_parts))
 
         # ---- 2) StepDiag ----
         if self._diag_step_stats is not None:
@@ -2187,6 +2344,8 @@ class Client_DF:
             # 借用 use_seen_routing 机制: masked_fill(-inf) 限制
             # hard route + soft attention 只在允许的 keys/anchors 上
             # --------------------------------------------------------
+            mask_verify = None
+            allowed_idx_dev = None
             if retrieval_allowed_mask is not None:
                 self.model.use_seen_routing = True
                 self.model.seen_class_mask.copy_(
@@ -2195,6 +2354,36 @@ class Client_DF:
                         dtype=self.model.seen_class_mask.dtype
                     )
                 )
+                # ---- v3b-Diag r5: RetrievalCF sanity check ----
+                # 四组不同 mask 曾给出完全相同的异常准确率（2.17%），
+                # 无法静态定位 → 评估过程中直接验证模型实际看到的状态:
+                #   mask_copy_pass:            copy_ 后 seen_class_mask 是否
+                #                              与预期掩码逐位一致
+                #   hard_idx_in_allowed_rate:  应 = 1.0000（hard route 全部
+                #                              落在允许集合内）
+                #   mean_finite_routing_logits: 应 = allowed_count（被
+                #                              mask_fill(-inf) 的列数正确）
+                #   soft_attention_allowed_mass: 应 ≈ 1.0000（softmax 后
+                #                              允许集合内的概率质量）
+                #   allowed_digest:            允许类别索引的 md5 短摘要
+                #                              （四组 mask 应各不相同）
+                allowed_idx = retrieval_allowed_mask.to(
+                    torch.bool).nonzero(as_tuple=False).squeeze(-1)
+                mask_verify = {
+                    'allowed_count': int(allowed_idx.numel()),
+                    'allowed_digest': hashlib.md5(
+                        allowed_idx.cpu().numpy().tobytes()
+                    ).hexdigest()[:8],
+                    'mask_copy_pass': torch.equal(
+                        self.model.seen_class_mask.detach().cpu().bool(),
+                        retrieval_allowed_mask.to(torch.bool).cpu()
+                    ),
+                    'n': 0,
+                    'hard_in_allowed': 0.0,
+                    'finite_logits_sum': 0.0,
+                    'soft_allowed_mass_sum': 0.0,
+                }
+                allowed_idx_dev = allowed_idx.to(self.device)
 
             # --------------------------------------------------------
             # 临时加载被评估任务对应的 head
@@ -2283,15 +2472,19 @@ class Client_DF:
 
                     # -----------------------------------------------
                     # Tail Anchor inference
+                    # （v3b-Diag r5: 第 5 个返回值 attn_weights 即真实
+                    #   soft_attn，用于 group-wise soft attention mass；
+                    #   第 7 个 routing_logits 用于 RetrievalCF sanity
+                    #   check 的 finite 列数验证）
                     # -----------------------------------------------
                     (
                         pre,
                         _,
                         _,
                         _,
-                        _,
+                        attn_weights,
                         hard_idx,
-                        _
+                        routing_logits
                     ) = self.model(
                         feat,
                         target,
@@ -2349,12 +2542,45 @@ class Client_DF:
                             hard_idx,
                             predicts,
                             target,
-                            task
+                            task,
+                            attn_weights=attn_weights
+                        )
+
+                    # -----------------------------------------------
+                    # v3b-Diag r5: RetrievalCF sanity check 累积
+                    # -----------------------------------------------
+                    if mask_verify is not None:
+                        mask_verify['n'] += len(target)
+                        mask_verify['hard_in_allowed'] += torch.isin(
+                            hard_idx, allowed_idx_dev
+                        ).float().sum().item()
+                        mask_verify['finite_logits_sum'] += (
+                            torch.isfinite(routing_logits)
+                            .sum().item()
+                        )
+                        mask_verify['soft_allowed_mass_sum'] += (
+                            attn_weights[:, allowed_idx_dev]
+                            .sum().item()
                         )
 
             acc = (
                 100.0 * correct / max(total, 1)
             )
+
+            # ---- v3b-Diag r5: RetrievalCF sanity check 输出 ----
+            if mask_verify is not None and mask_verify['n'] > 0:
+                n_v = mask_verify['n']
+                print(f"[TIDR-RetrievalCF-Check] client={self.id} "
+                      f"task={task} "
+                      f"allowed_count={mask_verify['allowed_count']} "
+                      f"allowed_digest={mask_verify['allowed_digest']} "
+                      f"mask_copy_pass={mask_verify['mask_copy_pass']} "
+                      f"hard_idx_in_allowed_rate="
+                      f"{mask_verify['hard_in_allowed'] / n_v:.4f} "
+                      f"mean_finite_routing_logits="
+                      f"{mask_verify['finite_logits_sum'] / n_v:.4f} "
+                      f"soft_attention_allowed_mass="
+                      f"{mask_verify['soft_allowed_mass_sum'] / n_v:.4f}")
 
             return acc, stats
 
@@ -2453,6 +2679,17 @@ class Client_DF:
             'all_collision': 0.0,
             'all_margin_sum': 0.0,
             'all_margin_negative': 0.0,
+            # v3b-Diag r5: group-wise soft attention mass（决定性诊断）
+            # Phase2 期间 query feature / raw Anchor 均未变而 retrieved
+            # anchor 巨幅漂移 → 到底是谁拿走了 soft retrieval mass。
+            # 分组口径与 per_task_classes / future_unseen_classes 完全
+            # 一致，各组 mass 之和（含被评估任务）= 1.0。
+            'soft_mass_eval_sum': 0.0,
+            'soft_mass_true_sum': 0.0,
+            'soft_mass_per_task_sum': {k: 0.0 for k in per_task_classes},
+            'soft_mass_future_sum': 0.0,
+            'soft_entropy_sum': 0.0,
+            'soft_max_w_sum': 0.0,
             # old-old
             'old_old_top1_correct': 0.0,
             'old_old_margin_sum': 0.0,
@@ -2469,13 +2706,17 @@ class Client_DF:
         }
 
     def _accumulate_diag_stats(self, stats, similarity, hard_idx, predicts,
-                               target, task):
+                               target, task, attn_weights=None):
         """
         E6a-v2-Diag: 样本级统计累积
         - old-old margin: cos(f, K_y) - max_{c∈旧任务其他类} cos(f, K_c)
         - old-new margin: cos(f, K_y) - max_{c∈new-only 类} cos(f, K_c)
         - 每类一个 Key（Tail_Anchor.key 为 [nb_class, key_size]），
           类别聚合规则与实际推理一致（无需额外聚合）
+        - v3b-Diag r5: attn_weights = forward 返回的真实 soft_attn（含
+          proto calibration / 温度等实际推理行为），按任务分组累积
+          soft attention mass。RetrievalCF 调用 collect_stats=False，
+          不会进入此分支，mass 始终是 Normal 口径。
         """
         n = len(target)
         stats['total'] += n
@@ -2577,6 +2818,38 @@ class Client_DF:
                 all_margin < 0
             ).float().sum().item()
 
+        # ---- v3b-Diag r5: group-wise soft attention mass ----
+        # 每样本先在组内求和（attn 列求和），再按样本累积；
+        # entropy / max_w 同时记录（对照 soft attention 失焦程度）
+        if attn_weights is not None:
+            stats['soft_mass_eval_sum'] += attn_weights[
+                :, eval_idx].sum(dim=1).sum().item()
+            stats['soft_mass_true_sum'] += attn_weights.gather(
+                1, target.unsqueeze(1)).squeeze(1).sum().item()
+            # v3b-Diag r6 修正: 类别来源 = per_task_classes，
+            # 累计结果 = soft_mass_per_task_sum（此前误把累积字典当
+            # 类别来源遍历，cls_k 拿到的是 0.0 而非类别列表）
+            for k, cls_k in (stats.get('per_task_classes')
+                             or {}).items():
+                idx_k = torch.tensor(
+                    cls_k, dtype=torch.long, device=similarity.device
+                )
+                stats['soft_mass_per_task_sum'][k] += attn_weights[
+                    :, idx_k].sum(dim=1).sum().item()
+            if stats.get('future_unseen_classes'):
+                fut_idx = torch.tensor(
+                    stats['future_unseen_classes'], dtype=torch.long,
+                    device=similarity.device
+                )
+                stats['soft_mass_future_sum'] += attn_weights[
+                    :, fut_idx].sum(dim=1).sum().item()
+            soft_ent = -(
+                attn_weights * torch.log(attn_weights.clamp_min(1e-8))
+            ).sum(dim=1)
+            stats['soft_entropy_sum'] += soft_ent.sum().item()
+            stats['soft_max_w_sum'] += attn_weights.max(
+                dim=1).values.sum().item()
+
         # ---- 样本级错误分解（关联分解，非因果分解） ----
         final_correct = (predicts == target)
         route_is_true = (hard_idx == target)
@@ -2672,13 +2945,47 @@ class Client_DF:
             result['to_any_non_eval_all_collision'] = all_col
             result['mean_vs_any_non_eval_all_margin'] = all_mgn
             result['neg_vs_any_non_eval_all_margin_rate'] = all_neg
+            # v3b-Diag r5: hard route → 被评估任务（= 1 - all 口径），
+            # 补全 SoftMassDiag / AttnMass 表格的 hard → T_eval 一列
+            result['to_eval_task_collision'] = 1.0 - all_col
             cross_fields.append(
                 f"to_any_non_eval_all_collision={all_col:.4f} "
                 f"mean_vs_any_non_eval_all_margin={all_mgn:.4f} "
-                f"neg_vs_any_non_eval_all_margin_rate={all_neg:.4f}"
+                f"neg_vs_any_non_eval_all_margin_rate={all_neg:.4f} "
+                f"to_eval_task_collision={1.0 - all_col:.4f}"
             )
         if cross_fields:
             result['cross_task_fields'] = ' '.join(cross_fields)
+
+        # ---- v3b-Diag r5: group-wise soft attention mass ----
+        # .get(default 0.0): 兼容旧 checkpoint extras 恢复的
+        # phase_stats_pre（无 soft-mass 累积器；SoftMassDiag 的 pre/post
+        # 对照另有键存在性检查，不会误把缺失打印成 0）
+        soft_fields = []
+        soft_items = [
+            ('soft_mass_to_eval_task',
+             stats.get('soft_mass_eval_sum', 0.0) / total),
+            ('soft_mass_to_true_key',
+             stats.get('soft_mass_true_sum', 0.0) / total),
+        ]
+        for k in sorted(stats.get('soft_mass_per_task_sum') or {}):
+            soft_items.append((
+                f'soft_mass_to_task{k}',
+                stats['soft_mass_per_task_sum'][k] / total))
+        if stats.get('future_unseen_classes'):
+            soft_items.append((
+                'soft_mass_to_future_unseen',
+                stats.get('soft_mass_future_sum', 0.0) / total))
+        soft_items.append((
+            'mean_soft_attn_entropy',
+            stats.get('soft_entropy_sum', 0.0) / total))
+        soft_items.append((
+            'mean_soft_attn_max_w',
+            stats.get('soft_max_w_sum', 0.0) / total))
+        for name, val in soft_items:
+            result[name] = val
+            soft_fields.append(f"{name}={val:.4f}")
+        result['soft_mass_fields'] = ' '.join(soft_fields)
 
         return result
 
@@ -2688,6 +2995,9 @@ class Client_DF:
         cross_str = m.get('cross_task_fields', '')
         if cross_str:
             cross_str = ' ' + cross_str
+        soft_str = m.get('soft_mass_fields', '')
+        if soft_str:
+            soft_str = ' ' + soft_str
         print(f"[{tag}] client={client_id} task={task} "
               f"to_current_task_collision={m['to_current_task_collision']:.4f} "
               f"mean_old_new_margin={m['mean_old_new_margin']:.4f} "
@@ -2702,7 +3012,8 @@ class Client_DF:
               f"wrong_and_old_new_collision={m['wrong_and_old_new_collision']:.4f}"
               f"({m['wrong_and_old_new_collision_of_wrong']:.4f}) "
               f"correct_and_non_true_route={m['correct_and_non_true_route']:.4f}"
-              f"{cross_str}")
+              f"{cross_str}"
+              f"{soft_str}")
 
     def _ensure_diag_fixed_inputs(self, max_samples=256):
         """

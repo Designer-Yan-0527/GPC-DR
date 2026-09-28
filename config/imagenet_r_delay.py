@@ -177,6 +177,13 @@ def get_args_parser(subparsers):
                             help='TIDR: only current-task keys receive CE gradient through differentiable retrieval')
     subparsers.add_argument('--anchor_no_wd', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='E6a-v3a-Diag: Phase2 optimizer 中 anchor_pool 免 weight decay（诊断旧 Anchor 范数坍缩是否由 weight decay 驱动）')
+    # ===== E6a-v3b B-实验: Phase2 最小因果干预（默认全部关闭 = B0 原样） =====
+    subparsers.add_argument('--p2_seen_only', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='B1/B3: Phase2 训练期 Seen-only retrieval（hard/soft 检索候选空间'
+                                 '限制为 T0..T_cur，屏蔽 future unseen keys 竞争；诊断钩子仍在 Normal 协议下评估）')
+    subparsers.add_argument('--p2_freeze_old_key', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='B2/B3: Phase2 训练期 old-Key freeze（每步 optimizer.step() 后用 '
+                                 'index_copy_ 恢复旧 Key 行快照，连 weight decay 一并消除）')
     subparsers.add_argument('--adaptive_gamma', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用置信度门控的自适应 γ')
     subparsers.add_argument('--gamma_max', default=0.30, type=float,

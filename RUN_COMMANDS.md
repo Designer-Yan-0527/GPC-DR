@@ -408,6 +408,98 @@ python "${common[@]}" --anchor_no_wd=True --run_tidr_diagnostics \
   `to_any_non_eval_all_collision` / `mean_vs_any_non_eval_all_margin` /
   `neg_vs_any_non_eval_all_margin_rate`（全部类别 - 被评估任务类 =
   已见非评估 + future 的总和口径），用于研究 cross-task routing accumulation
+- `[TIDR-SoftMassDiag]`（v3b-Diag r5，决定性诊断）Task0 评估时 group-wise
+  soft attention mass 的 post_p1 vs post_p2 对照：
+  `soft_mass_to_eval_task` / `soft_mass_to_task{k}`（各已见任务含当前）/
+  `soft_mass_to_future_unseen` / `soft_mass_to_true_key` /
+  `mean_soft_attn_entropy` / `mean_soft_attn_max_w`，以及同表 hard route
+  各组 `to_eval_task_collision` / `to_task{k}_collision` /
+  `to_future_unseen_collision`。格式 `{key}_post_p1=… {key}_post_p2=…`
+  `{key}_p2_change=±…`。若 future soft mass 在 P2 后大幅上升，
+  Failure Mode II（Phase2 retrieval geometry 崩坏）即钉死
+- `[TIDR-RetrievalCF-Check]`（v3b-Diag r5）每次掩码 CF 评估的 sanity check：
+  `allowed_count` / `allowed_digest`（允许类别索引 md5 短摘要，四组应不同）/
+  `mask_copy_pass` / `hard_idx_in_allowed_rate`（应 =1.0000）/
+  `mean_finite_routing_logits`（应 = allowed_count）/
+  `soft_attention_allowed_mass`（应 ≈1.0000）。任一项不符 = 掩码未按预期
+  生效，`[TIDR-RetrievalCF]` 的 acc 不可用
+
+#### E6a-v3b B-实验：R10 同起点最小因果干预（B0/B1/B2/B3）
+
+所有组从**同一个** `R10_C0_pre_phase2.pth`（Task0=82.34 / Task1=96.34 /
+Task2=2.64 起点）恢复，只跑 C0 Phase2 + 完整诊断后立即停止
+（`--stop_at_checkpoint R5_C0_post_phase2` 在 phase2_end 诊断与 CP3 保存后
+触发 DiagStopException 干净退出，不跑 C1-C4、不聚合、不进 Round11）。
+
+```bash
+runDir=./checkpoints/E6a_v2_diag/cifar100_seed42_20260928_104012
+# B0 基线（当前 No-WD 原样；预期复现 T0=39.40）
+python "${common[@]}" --anchor_no_wd=True \
+  --run_tidr_diagnostics --save_checkpoints --diag_cf_round 10 \
+  --resume_checkpoint "${runDir}/R10_C0_pre_phase2.pth" \
+  --stop_at_checkpoint R5_C0_post_phase2
+
+# B1 Seen-only retrieval（只允许 T0+T1+T2 参与 Phase2 训练期检索）
+python "${common[@]}" --anchor_no_wd=True --p2_seen_only=True \
+  --run_tidr_diagnostics --save_checkpoints --diag_cf_round 10 \
+  --resume_checkpoint "${runDir}/R10_C0_pre_phase2.pth" \
+  --stop_at_checkpoint R5_C0_post_phase2
+
+# B2 old-Key freeze（每步 optimizer.step() 后恢复旧 Key 行快照）
+python "${common[@]}" --anchor_no_wd=True --p2_freeze_old_key=True \
+  --run_tidr_diagnostics --save_checkpoints --diag_cf_round 10 \
+  --resume_checkpoint "${runDir}/R10_C0_pre_phase2.pth" \
+  --stop_at_checkpoint R5_C0_post_phase2
+
+# B3 Seen-only + freeze old Key
+python "${common[@]}" --anchor_no_wd=True --p2_seen_only=True --p2_freeze_old_key=True \
+  --run_tidr_diagnostics --save_checkpoints --diag_cf_round 10 \
+  --resume_checkpoint "${runDir}/R10_C0_pre_phase2.pth" \
+  --stop_at_checkpoint R5_C0_post_phase2
+```
+
+判定参考 —— 注意 B1 是 **training-time 干预**：Phase2 训练时 seen-only ON，
+结束后恢复 Normal routing，post-P2 诊断在 Normal（all-keys）协议下评估。
+因此 B0/B1 各自的 normal 与 `acc_seen_only`（RetrievalCF）天然组成
+**2×2 counterfactual**（训练端 × 推理端候选空间）：
+
+| Phase2 训练 | 推理时候选空间 | 对应结果                              |
+| ----------- | -------------- | ------------------------------------- |
+| all keys    | all keys       | **B0 normal**                        |
+| all keys    | seen-only      | **B0 的 `acc_seen_only` RetrievalCF** |
+| seen-only   | all keys       | **B1 normal**                        |
+| seen-only   | seen-only      | **B1 的 `acc_seen_only` RetrievalCF** |
+
+三组因果分解（均相对 B0 normal，即 Task0 post-P2 = 39.40 起点）：
+
+- `B0 acc_seen_only − B0 normal` 大幅为正
+  → **inference-time future-key competition 是主因**（不需要重新训练，
+  仅屏蔽推理候选空间即可恢复）
+- `B1 normal − B0 normal` 大幅为正
+  → future keys 在 **Phase2 训练过程中**也造成参数学习污染
+  （训练时不在候选空间 → old key/anchor/head 不被 future 竞争挤压）
+- `B1 acc_seen_only` 四格最高
+  → train + inference 两端都应 seen-only（v3b 端到端方案）
+- B2 ≈ +5~10pp（KeyCF 交叉验证 +7.61）：与现有诊断一致，非主修复
+- B3 vs B1/B2 的叠加关系决定 v3b 是否需要双修（Seen-only + Key 保护）
+
+结论映射更新：**"v3b 核心 = 不允许未训练 keys 参与 retrieval"需要由
+上面第一/第三格共同支持**——B1 normal 单独走强只证明训练端屏蔽的作用，
+推理端是否也要屏蔽由 B0 的 `acc_seen_only` 与 B1 的 `acc_seen_only` 决定。
+
+**执行顺序：先只跑 B0。** B0 一次验证三件事：① 复现 Task0 post-P2
+= 39.40；② RetrievalCF sanity check 四项全部通过
+（`mask_copy_pass=True`、`hard_idx_in_allowed_rate=1.0000`、
+`mean_finite_routing_logits=allowed_count`、
+`soft_attention_allowed_mass≈1.0000`）；③ SoftMassDiag post-P1→post-P2
+变化合理。若 B0 的 `acc_seen_only` 从 39.40 大幅恢复且 sanity check
+全过，则在 B1 开始前即可直接证明 future-unseen keys 在推理候选空间中的
+存在本身是 Failure Mode II 的重要因果因素。B0 通过后再连跑 B1/B2/B3。
+
+干预自检日志：`[E6a-v3b-B1]`（allowed=N/100 + 结束后恢复确认）、
+`[E6a-v3b-B2]`（n_old_keys + `old_key_bitwise_preserved=True` 必须成立）。
+诊断钩子（phase2_start 的 pre-P2 基线、phase2_end 的全部 post-P2 诊断）
+均在 Normal 协议（无掩码、原 routing 配置）下运行，四组之间可比。
 
 ### E6b. Full GPC-DR (E3 + Diff. Retrieval + Proto Calibration + GPA)
 
