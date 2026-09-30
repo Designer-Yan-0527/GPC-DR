@@ -104,6 +104,8 @@ class Client_DF:
         self.diversity_margin = getattr(args, 'diversity_margin', 0.2)
         self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.1)
         self.key_temporal_ratio = getattr(args, 'key_temporal_ratio', 0.5)
+        # Evaluation repeatability sanity check (debug 用，默认关闭)
+        self.eval_repeat_check = getattr(args, 'eval_repeat_check', False)
         # -------------------------------------------------------------------
 
         self.model = self._init_local_model(model_name)
@@ -373,6 +375,8 @@ class Client_DF:
         # =============================================================
         # Phase 1: Train prompts with Soft Prompt Retrieval + MSP
         # =============================================================
+        # 恢复训练模式（上一轮 evaluate 已将 vit 置于 eval 模式）
+        self.vit.train()
         optimizer = torch.optim.Adam(self.vit.parameters(), lr=self.lr, weight_decay=1e-3)
         criterion = torch.nn.CrossEntropyLoss().to(self.device)
 
@@ -632,6 +636,19 @@ class Client_DF:
             self.evaluate(self.task_id, args.nb_classes,
                           phase="Local Training", notes_prefix="Local evaluation on task")
 
+        # ---- Evaluation repeatability sanity ----
+        # 同一 checkpoint、同一 task 连续评估两次，acc 必须完全一致
+        if self.eval_repeat_check and self.round == 0:
+            acc1 = self.evaluate(self.task_id, args.nb_classes,
+                                 phase="Repeatability Check",
+                                 notes_prefix="[RepeatCheck-1] task")
+            acc2 = self.evaluate(self.task_id, args.nb_classes,
+                                 phase="Repeatability Check",
+                                 notes_prefix="[RepeatCheck-2] task")
+            match = abs(acc1 - acc2) < 1e-9
+            print(f"[EvalRepeat] client={self.id} task={self.task_id} "
+                  f"acc1={acc1:.6f} acc2={acc2:.6f} match={match}")
+
         self.prompts = deepcopy(self.vit.get_prompts())
 
 
@@ -733,9 +750,15 @@ class Client_DF:
     def evaluate(self, task=0, nb_classes=None, phase="Server Aggregation",
                  notes_prefix="Global evaluation on task"):
         """使用提示和分类头进行标准评估"""
+        # 评估状态清理: 三个模块全部进入 eval 模式
+        # （关闭 Chead 内 Dropout(0.5)、ViT Dropout/DropPath、usage buffer 更新）
+        if self.original_model is not None:
+            self.original_model.eval()
+        self.vit.eval()
         self.model.eval()
+        # 固定评估顺序，保证可复现（不改变预测公式）
         test_data = self.test_loader[task]
-        test_loader = DataLoader(test_data, batch_size=8, shuffle=True)
+        test_loader = DataLoader(test_data, batch_size=8, shuffle=False)
         correct = 0
         total = 0
 
@@ -750,8 +773,10 @@ class Client_DF:
                 if self.original_model is not None:
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
-                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    feat = output['feat'].to(self.device)
+                # task_id=self.task_id: 该参数在 ViT forward 中未被使用
+                # （prompt 由 key-query 相似度检索，与 task_id 无关），保持原语义
+                output = self.vit(input, task_id=self.task_id, cls_features=output, train=False)
+                feat = output['feat'].to(self.device)
 
                 # E1 soft inference
                 pre, _, _, _, _, hard_idx, _ = self.model(

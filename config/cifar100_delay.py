@@ -152,3 +152,7 @@ def get_args_parser(subparsers):
                             help='Key+Anchor Temporal Stability 系数')
     subparsers.add_argument('--key_temporal_ratio', default=0.5, type=float,
                             help='Key temporal 在总 temporal loss 中的权重 η')
+
+    # -- Debug / Sanity --
+    subparsers.add_argument('--eval_repeat_check', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='评估可重复性检查: round0 时对同一 task 连续评估两次并比对')

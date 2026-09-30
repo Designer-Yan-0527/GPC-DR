@@ -242,6 +242,18 @@ class Server_DF(object):
         - 分类头聚合
         - 向客户端分发全局模型
         """
+        # ---- 一次性 sanity 日志: 打印所有 requires_grad=True 的参数 ----
+        # （ViT 为所有 client 共享的 self.model；Tail_Anchor 取 client0 的本地模型）
+        print("===== Trainable ViT Parameters =====")
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                print(name, tuple(p.shape))
+        if self.clients and self.clients[0].model is not None:
+            print("===== Trainable Tail_Anchor Parameters =====")
+            for name, p in self.clients[0].model.named_parameters():
+                if p.requires_grad:
+                    print(name, tuple(p.shape))
+
         for i in range(start_round, self.task_num * self.global_epoch):
             self.thisclients = list(range(self.client_num))
 

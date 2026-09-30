@@ -152,7 +152,10 @@ class Tail_Anchor(nn.Module):
         self.anchor_usage.zero_()
 
     def load_head(self, head):
-        self.head = deepcopy(head)
+        """加载分类头权重（保持 Module/Parameter 对象不变，避免评估副作用）"""
+        if head is None:
+            return
+        self.head.load_state_dict(head.state_dict())
 
     def get_head(self):
         return self.head
